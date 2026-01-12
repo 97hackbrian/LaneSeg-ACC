@@ -1,0 +1,2 @@
+# Place your TensorRT .plan model files here
+# Expected file: cityscapes_fan_tiny_hybrid_224.plan

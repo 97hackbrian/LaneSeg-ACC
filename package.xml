@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+    <name>qcar2_laneseg_acc</name>
+    <version>0.1.0</version>
+    <description>SegFormer semantic segmentation pipeline for QCar2 using Isaac ROS v2.1 NITROS</description>
+    <maintainer email="hackbrian@example.com">hackbrian</maintainer>
+    <license>MIT</license>
+
+    <buildtool_depend>ament_cmake</buildtool_depend>
+    <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+    <!-- ROS 2 Core -->
+    <depend>rclpy</depend>
+    <depend>rclcpp</depend>
+    <depend>std_msgs</depend>
+    <depend>sensor_msgs</depend>
+    <depend>cv_bridge</depend>
+
+    <!-- Isaac ROS Dependencies -->
+    <depend>isaac_ros_tensor_list_interfaces</depend>
+    <depend>isaac_ros_dnn_image_encoder</depend>
+    <depend>isaac_ros_tensor_rt</depend>
+    <depend>isaac_ros_nitros</depend>
+
+    <!-- Launch -->
+    <exec_depend>launch</exec_depend>
+    <exec_depend>launch_ros</exec_depend>
+
+    <export>
+        <build_type>ament_cmake</build_type>
+    </export>
+</package>

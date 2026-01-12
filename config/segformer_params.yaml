@@ -1,0 +1,26 @@
+# SegFormer Inference Pipeline Parameters
+# Based on trtexec compilation: 1x3x224x224 input
+
+segformer_pipeline:
+  ros__parameters:
+    # Camera input topic
+    input_image_topic: "/camera/color_image"
+    
+    # Model configuration (from trtexec)
+    model:
+      engine_file_path: "cityscapes_fan_tiny_hybrid_224.plan"
+      input_tensor_name: "input"
+      output_tensor_name: "output"  # Adjust based on actual ONNX output name
+      input_width: 224
+      input_height: 224
+      num_classes: 19  # Cityscapes classes
+    
+    # ImageNet normalization (for DNN Image Encoder)
+    normalization:
+      mean: [0.485, 0.456, 0.406]
+      std: [0.229, 0.224, 0.225]
+    
+    # Output topics
+    output:
+      mask_topic: "/segmentation/mask"
+      colored_mask_topic: "/segmentation/colored_mask"
