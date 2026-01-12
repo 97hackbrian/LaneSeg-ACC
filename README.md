@@ -1,40 +1,25 @@
 # LaneSeg-ACC
 
-Proyecto orientado a la segmentación y detección de carriles (lane detection / lane segmentation) para aplicaciones de conducción autónoma y robótica móvil.
+steps:
 
-## Enlaces de interés y referencias
 
-### Sistemas y pipelines completos
-- **Self-driving-ish Computer Vision System**  
-  https://github.com/iwatake2222/self-driving-ish_computer_vision_system
+/usr/src/tensorrt/bin/trtexec \
+  --onnx=segformer_fixed_unique.onnx \
+  --saveEngine=cityscapes_fan_tiny_hybrid_224.plan \
+  --fp16 \
+  --minShapes=unique_tensor_0:1x3x224x224 \
+  --optShapes=unique_tensor_0:1x3x224x224 \
+  --maxShapes=unique_tensor_0:1x3x224x224 \
+  --tacticSources=-CUBLAS,-CUBLAS_LT,-CUDNN,+EDGE_MASK_CONVOLUTIONS \
+  --verbose
 
-### Modelos y métodos de detección de carriles
-- **Ultra-Fast Lane Detection**  
-  https://github.com/cfzd/Ultra-Fast-Lane-Detection
+  
+git clone -b release-2.1 https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_dnn_inference.git
+git clone -b release-2.1 https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_image_pipeline.git
+git clone -b release-2.1 https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_nitros.git
+git clone -b release-2.1 https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_image_segmentation.git
 
-- **Lane Detection con U-Net**  
-  https://github.com/AnshChoudhary/Lane-Detection-UNet/tree/main
+colcon build --symlink-install --packages-up-to isaac_ros_tensor_rt isaac_ros_dnn_image_encoder isaac_ros_nitros
 
-- **PriorLane**  
-  https://github.com/vincentqqb/PriorLane
+colcon build --symlink-install --packages-up-to qcar2_autonomy qcar2_interfaces qcar2_nodes qcar2_lane_following
 
-- **PersFormer – 3D Lane Detection**  
-  https://github.com/OpenDriveLab/PersFormer_3DLane
-
-### Transformers y segmentación semántica
-- **Fine-Tuning SegFormer para Lane Detection (BDD100K)**  
-  https://github.com/spmallick/learnopencv/blob/master/Fine-Tuning-SegFormer-For-Lane-Detection/Fine-Tune-SegFormer-BDD.ipynb
-
-- **SegFormer preentrenado (Cityscapes – NVIDIA TAO)**  
-  https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tao/models/pretrained_segformer_cityscapes?version=deployable_fan_tiny_hybrid_v1.0
-
-### ROS 2 y NVIDIA Isaac
-- **Isaac ROS – Image Segmentation**  
-  https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_image_segmentation
-
-### Colecciones y listas curadas
-- **Awesome Lane Detection**  
-  https://github.com/Core9724/Awesome-Lane-Detection
-
-- **Lane Detection – Awesome List**  
-  https://github.com/xukun-zhang/Lane-Detection-awesome-lane-detection

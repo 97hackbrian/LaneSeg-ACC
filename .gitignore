@@ -60,3 +60,7 @@ core
 
 models/oficial/labels.txt
 models/oficial/nvinfer_config.txt
+models/segformer/oficial/labels.txt
+models/segformer/oficial/nvinfer_config.txt
+models/unet/unet_best.pt
+models/unet/unet_jit.pnnx.param
