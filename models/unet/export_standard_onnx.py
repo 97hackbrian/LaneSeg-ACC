@@ -1,63 +1,93 @@
-import torch
-import onnx
-import sys
-import os
+import launch
+from launch_ros.actions import ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
 
-sys.path.append(os.getcwd())
-
-try:
-    from models.unet import UNet
-except ImportError as e:
-    print("Error importando UNet. Verifica 'models/unet.py'")
-    sys.exit(1)
-
-# --- CONFIGURACIÓN ---
-pth_path = "unet_best.pt"
-onnx_path = "lane_unet.onnx"
-input_shape = (1, 3, 256, 256)
-
-print(f"--> Inicializando UNet (in=3, out=1)...")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = UNet(in_channels=3, out_channels=1)
-
-print(f"--> Cargando checkpoint desde {pth_path}...")
-try:
-    # 1. Cargar el archivo completo (es un diccionario)
-    checkpoint = torch.load(pth_path, map_location=device)
+def generate_launch_description():
     
-    # 2. Verificar si es un checkpoint completo o solo pesos
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        print("    Detectado formato Checkpoint completo.")
-        print(f"    (Info: Epoch {checkpoint.get('epoch', '?')}, Loss {checkpoint.get('val_loss', '?')})")
-        weights = checkpoint['model_state_dict']
-    else:
-        print("    Detectado formato State Dict simple.")
-        weights = checkpoint
+    # --- CONFIGURACIÓN ---
+    CAMERA_WIDTH = 640
+    CAMERA_HEIGHT = 480
+    
+    # Nombres
+    INPUT_TENSOR = 'input_0'
+    OUTPUT_TENSOR = 'output_0'
+    
+    # RUTAS (¡AMBAS SON NECESARIAS PARA EVITAR CRASH!)
+    MODEL_PATH_ONNX = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.onnx'
+    ENGINE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.plan'
 
-    # 3. Cargar los pesos al modelo
-    model.load_state_dict(weights)
-    print("    ¡Pesos cargados exitosamente!")
+    lane_seg_container = ComposableNodeContainer(
+        name='lane_seg_container',
+        namespace='',
+        package='rclcpp_components',
+        executable='component_container_mt',
+        composable_node_descriptions=[
+            
+            # --- 1. ENCODER ---
+            ComposableNode(
+                package='isaac_ros_dnn_image_encoder',
+                plugin='nvidia::isaac_ros::dnn_inference::DnnImageEncoderNode',
+                name='dnn_image_encoder',
+                parameters=[{
+                    'input_image_width': CAMERA_WIDTH,
+                    'input_image_height': CAMERA_HEIGHT,
+                    'network_image_width': 256,
+                    'network_image_height': 256,
+                    'image_mean': [0.485, 0.456, 0.406],
+                    'image_stddev': [0.229, 0.224, 0.225],
+                    'enable_padding': False,
+                    'tensor_output_order': 'NCHW',
+                    'tensor_name': INPUT_TENSOR, 
+                    'num_blocks': 40
+                }],
+                remappings=[
+                    ('image', '/camera/color_image'),
+                    ('encoded_tensor', '/tensor_input')
+                ]
+            ),
 
-except Exception as e:
-    print(f"\nERROR FATAL AL CARGAR PESOS:\n{e}")
-    sys.exit(1)
+            # --- 2. TENSORRT ---
+            ComposableNode(
+                package='isaac_ros_tensor_rt',
+                plugin='nvidia::isaac_ros::dnn_inference::TensorRTNode',
+                name='tensor_rt',
+                parameters=[{
+                    'model_file_path': MODEL_PATH_ONNX,   # <--- ANTÍDOTO CONTRA SEGFAULT
+                    'engine_file_path': ENGINE_PATH,
+                    
+                    'input_tensor_names': [INPUT_TENSOR],
+                    'output_tensor_names': [OUTPUT_TENSOR],
+                    'input_binding_names': [INPUT_TENSOR],
+                    'output_binding_names': [OUTPUT_TENSOR],
+                    
+                    'verbose': True,
+                    'force_engine_update': False
+                }],
+                remappings=[
+                    ('tensor_sub', '/tensor_input'),
+                    ('tensor_pub', '/tensor_output')
+                ]
+            ),
 
-model.to(device)
-model.eval()
+            # --- 3. DECODER ---
+            ComposableNode(
+                package='isaac_ros_unet',
+                plugin='nvidia::isaac_ros::unet::UNetDecoderNode',
+                name='unet_decoder',
+                parameters=[{
+                    'network_output_type': 'sigmoid',
+                    'color_segmentation_mask_encoding': 'rgb8',
+                    'mask_width': 256,
+                    'mask_height': 256,
+                    'color_palette': [0, 0, 0, 0, 255, 0] # Verde
+                }],
+                remappings=[
+                    ('tensor_sub', '/tensor_output'),
+                    ('unet/raw_segmentation_mask', '/lane_detection/mask')
+                ]
+            )
+        ],
+        output='screen'
+    )
 
-# --- EXPORTAR A ONNX ---
-dummy_input = torch.randn(*input_shape).to(device)
-
-print(f"--> Exportando a {onnx_path}...")
-torch.onnx.export(
-    model,
-    dummy_input,
-    onnx_path,
-    opset_version=11,
-    input_names=['input_0'],
-    output_names=['output_0'],
-    do_constant_folding=True
-)
-
-print(f"\n¡LISTO! Modelo guardado en: {onnx_path}")
-print(f"Usa estos nombres en Isaac ROS -> Input: 'input_0', Output: 'output_0'")
+    return launch.LaunchDescription([lane_seg_container])
