@@ -4,19 +4,21 @@ from launch_ros.descriptions import ComposableNode
 
 def generate_launch_description():
     
-    # --- CONFIGURACIÓN DE CÁMARA ---
-    # (Ajustado a lo que detectamos: VGA)
+    # ---------------------------------------------------------
+    # 1. CONFIGURACIÓN CORRECTA
+    # ---------------------------------------------------------
+    # ¡CRÍTICO! Debe coincidir con tu 'ros2 topic echo' (VGA)
     CAMERA_WIDTH = 640
     CAMERA_HEIGHT = 480
     
-    # --- RUTAS DE MODELOS ---
-    # ¡IMPORTANTE!: TensorRT necesita AMBOS archivos para ser robusto
-    MODEL_PATH_ONNX = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.onnx'
-    ENGINE_FILE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.plan'
-    
+    # Modelo
     INPUT_TENSOR = 'input_0'
     OUTPUT_TENSOR = 'output_0'
+    ENGINE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.plan'
 
+    # ---------------------------------------------------------
+    # 2. CONTENEDOR DE NODOS
+    # ---------------------------------------------------------
     lane_seg_container = ComposableNodeContainer(
         name='lane_seg_container',
         namespace='',
@@ -24,7 +26,7 @@ def generate_launch_description():
         executable='component_container_mt',
         composable_node_descriptions=[
             
-            # 1. ENCODER
+            # --- NODO ENCODER ---
             ComposableNode(
                 package='isaac_ros_dnn_image_encoder',
                 plugin='nvidia::isaac_ros::dnn_inference::DnnImageEncoderNode',
@@ -36,8 +38,8 @@ def generate_launch_description():
                     'network_image_height': 256,
                     'image_mean': [0.485, 0.456, 0.406],
                     'image_stddev': [0.229, 0.224, 0.225],
-                    'enable_padding': False,
-                    'tensor_output_order': 'NCHW' # Coincide con PyTorch
+                    'enable_padding': False, 
+                    'tensor_output_order': 'NCHW' # Vital para PyTorch
                 }],
                 remappings=[
                     ('image', '/camera/color_image'),
@@ -45,14 +47,14 @@ def generate_launch_description():
                 ]
             ),
 
-            # 2. TENSORRT
+            # --- NODO TENSORRT ---
             ComposableNode(
                 package='isaac_ros_tensor_rt',
                 plugin='nvidia::isaac_ros::dnn_inference::TensorRTNode',
                 name='tensor_rt',
                 parameters=[{
-                    'model_file_path': MODEL_PATH_ONNX,   # <--- ¡LA SOLUCIÓN!
-                    'engine_file_path': ENGINE_FILE_PATH,
+                    'engine_file_path': ENGINE_PATH,
+                    # NO INCLUIMOS model_file_path PARA EVITAR REBUILD/CRASH
                     
                     'input_tensor_names': [INPUT_TENSOR],
                     'output_tensor_names': [OUTPUT_TENSOR],
@@ -68,7 +70,7 @@ def generate_launch_description():
                 ]
             ),
 
-            # 3. DECODER
+            # --- NODO DECODER ---
             ComposableNode(
                 package='isaac_ros_unet',
                 plugin='nvidia::isaac_ros::unet::UNetDecoderNode',
