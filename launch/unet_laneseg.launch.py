@@ -78,46 +78,67 @@ def generate_launch_description():
     # ---------------------------------------------------------
     # CONTENEDOR 3: INFERENCIA (TensorRT + Decoder)
     # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    # CONTENEDOR 3: INFERENCIA (TensorRT + Decoder)
+    # ---------------------------------------------------------
+    # NOTA: Asegúrate de tener el archivo .onnx en esta ruta
+    # Si solo tienes el .plan viejo, BÓRRALO. Necesitamos regenerarlo.
+    MODEL_SOURCE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.onnx'
+    ENGINE_OUTPUT_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.plan'
+
     inference_container = ComposableNodeContainer(
         name='inference_container',
         namespace='',
         package='rclcpp_components',
-        executable='component_container', # Estándar
+        executable='component_container',
         composable_node_descriptions=[
-            # TensorRT
+            # 1. TensorRT Node (El Motor)
             ComposableNode(
                 package='isaac_ros_tensor_rt',
                 plugin='nvidia::isaac_ros::dnn_inference::TensorRTNode',
                 name='tensor_rt',
                 parameters=[{
-                    'engine_file_path': ENGINE_PATH,
+                    # --- GENERACIÓN AUTOMÁTICA DEL MOTOR ---
+                    'model_file_path': MODEL_SOURCE_PATH,   # Le damos el ONNX original
+                    'engine_file_path': ENGINE_OUTPUT_PATH, # Donde guardará el .plan nuevo
+                    'force_engine_update': False,           # Cambia a True si actualizas el ONNX
+                    # ---------------------------------------
+                    
                     'input_tensor_names': [INPUT_TENSOR],
                     'output_tensor_names': [OUTPUT_TENSOR],
                     'input_binding_names': [INPUT_TENSOR],
                     'output_binding_names': [OUTPUT_TENSOR],
-                    'verbose': False,
-                    'force_engine_update': False
+                    
+                    # Debugging: Veremos el progreso de compilación en el log
+                    'verbose': True 
                 }],
                 remappings=[
                     ('tensor_sub', '/tensor_input'),
                     ('tensor_pub', '/tensor_output')
                 ]
             ),
-            # Decoder
+            
+            # 2. UNet Decoder Node (El Traductor Visual)
             ComposableNode(
                 package='isaac_ros_unet',
                 plugin='nvidia::isaac_ros::unet::UNetDecoderNode',
                 name='unet_decoder',
                 parameters=[{
-                    'network_output_type': 'sigmoid',
+                    'network_output_type': 'sigmoid', # 'sigmoid' para 2 clases, 'argmax' para mas
                     'color_segmentation_mask_encoding': 'rgb8',
                     'mask_width': NETWORK_WIDTH,
                     'mask_height': NETWORK_HEIGHT,
-                    'color_palette': [0, 0, 0, 0, 255, 0]
+                    
+                    # CORRECCIÓN SEGÚN GUÍA 2.1:
+                    # Formato Hexadecimal: [Fondo, Clase1, Clase2...]
+                    # 0x000000 = Negro (Fondo)
+                    # 0x00FF00 = Verde (Carril)
+                    'color_palette': [0x000000, 0x00FF00] 
                 }],
                 remappings=[
                     ('tensor_sub', '/tensor_output'),
-                    ('unet/raw_segmentation_mask', '/lane_detection/mask')
+                    ('unet/raw_segmentation_mask', '/lane_detection/mask_raw'),
+                    ('unet/colored_segmentation_mask', '/lane_detection/mask_viz')
                 ]
             )
         ],
