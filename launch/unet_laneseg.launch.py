@@ -25,28 +25,6 @@ def generate_launch_description():
         package='rclcpp_components',
         executable='component_container_mt',
         composable_node_descriptions=[
-            
-            # --- NODO ENCODER ---
-            ComposableNode(
-                package='isaac_ros_dnn_image_encoder',
-                plugin='nvidia::isaac_ros::dnn_inference::DnnImageEncoderNode',
-                name='dnn_image_encoder',
-                parameters=[{
-                    'input_image_width': CAMERA_WIDTH,
-                    'input_image_height': CAMERA_HEIGHT,
-                    'network_image_width': 256,
-                    'network_image_height': 256,
-                    'image_mean': [0.485, 0.456, 0.406],
-                    'image_stddev': [0.229, 0.224, 0.225],
-                    'enable_padding': False, 
-                    'tensor_output_order': 'NCHW' # Vital para PyTorch
-                }],
-                remappings=[
-                    ('image', '/camera/color_image'),
-                    ('encoded_tensor', '/tensor_input')
-                ]
-            ),
-
             # --- NODO TENSORRT ---
             ComposableNode(
                 package='isaac_ros_tensor_rt',
@@ -65,7 +43,7 @@ def generate_launch_description():
                     'force_engine_update': False
                 }],
                 remappings=[
-                    ('tensor_sub', '/tensor_input'),
+                    ('tensor_sub', '/camera/color_image'),
                     ('tensor_pub', '/tensor_output')
                 ]
             ),
