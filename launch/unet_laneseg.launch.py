@@ -33,7 +33,7 @@ def generate_launch_description():
                     'num_blocks': 40
                 }],
                 remappings=[
-                    ('image', '/buffer/image'),
+                    ('image', '/buffer/image_resized'),
                     ('resize/image', '/image_resized'),
                     ('camera_info', '/buffer/camera_info')
                 ]
