@@ -113,8 +113,8 @@ def generate_launch_description():
                     'verbose': True 
                 }],
                 remappings=[
-                    ('tensor_sub', '/tensor_input'),
-                    ('tensor_pub', '/tensor_output')
+                    ('tensor_pub', '/tensor_input'),
+                    ('tensor_sub', '/tensor_output')
                 ]
             ),
             
