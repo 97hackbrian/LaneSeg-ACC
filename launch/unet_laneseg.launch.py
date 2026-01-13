@@ -33,9 +33,9 @@ def generate_launch_description():
                     'num_blocks': 40
                 }],
                 remappings=[
-                    ('image', '/camera/color_image'),
+                    ('image', '/buffer/image'),
                     ('resize/image', '/image_resized'),
-                    ('camera_info', '/camera/camera_info')
+                    ('camera_info', '/buffer/camera_info')
                 ]
             )
         ],
