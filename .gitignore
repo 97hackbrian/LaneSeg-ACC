@@ -54,6 +54,8 @@ CATKIN_IGNORE
 core
 *.ply
 *.onnx
+*.plan
+*.pt
 
 *.zip
 /oficial
@@ -64,3 +66,5 @@ models/segformer/oficial/labels.txt
 models/segformer/oficial/nvinfer_config.txt
 models/unet/unet_best.pt
 models/unet/unet_jit.pnnx.param
+models/unet/lane_unet.plan
+models/unet/lane_unet.plan
