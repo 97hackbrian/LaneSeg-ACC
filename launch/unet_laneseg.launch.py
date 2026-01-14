@@ -82,8 +82,8 @@ def generate_launch_description():
     # ---------------------------------------------------------
     # NOTA: Asegúrate de tener el archivo .onnx en esta ruta
     # Si solo tienes el .plan viejo, BÓRRALO. Necesitamos regenerarlo.
-    MODEL_SOURCE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet_depthwise.onnx'
-    ENGINE_OUTPUT_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet_depthwise.plan'
+    MODEL_SOURCE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.onnx'
+    ENGINE_OUTPUT_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.plan'
 
     inference_container = ComposableNodeContainer(
         name='inference_container',
