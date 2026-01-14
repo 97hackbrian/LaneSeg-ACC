@@ -60,8 +60,8 @@ def generate_launch_description():
                     'input_image_height': NETWORK_HEIGHT,
                     'network_image_width': NETWORK_WIDTH,
                     'network_image_height': NETWORK_HEIGHT,
-                    'image_mean': [0.485, 0.456, 0.406],
-                    'image_stddev': [0.229, 0.224, 0.225],
+                    'image_mean': [0.0, 0.0, 0.0],
+                    'image_stddev': [1.0, 1.0, 1.0],
                     'tensor_output_order': 'NHWC',
                     'num_blocks': 40
                 }],
