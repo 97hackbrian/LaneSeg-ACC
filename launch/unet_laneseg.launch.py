@@ -103,7 +103,7 @@ def generate_launch_description():
                     'force_engine_update': True,           # Cambia a True si actualizas el ONNX
                     # ---------------------------------------
                     'input_tensor_names': ['input_tensor'],
-                    'output_tensor_names': ['output_tensor'],
+                    'output_tensor_names': [OUTPUT_TENSOR],
                     'input_binding_names': [INPUT_TENSOR],
                     'output_binding_names': [OUTPUT_TENSOR],
                     'verbose': True 
