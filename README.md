@@ -9,6 +9,9 @@ steps:
   --fp16 \
   --verbose
 
+
+/usr/src/tensorrt/bin/trtexec   --onnx=/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.onnx   --saveEngine=/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.plan   --outputIOFormats=fp32:hwc   --verbose
+
   
 git clone -b release-2.1 https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_dnn_inference.git
 git clone -b release-2.1 https://github.com/NVIDIA-ISAAC-ROS/isaac_ros_image_pipeline.git

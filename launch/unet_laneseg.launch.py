@@ -63,7 +63,6 @@ def generate_launch_description():
                     'image_mean': [0.485, 0.456, 0.406],
                     'image_stddev': [0.229, 0.224, 0.225],
                     'tensor_output_order': 'NCHW',
-                    'tensor_name': INPUT_TENSOR, 
                     'num_blocks': 40
                 }],
                 remappings=[
@@ -101,15 +100,12 @@ def generate_launch_description():
                     # --- GENERACIÓN AUTOMÁTICA DEL MOTOR ---
                     'model_file_path': MODEL_SOURCE_PATH,   # Le damos el ONNX original
                     'engine_file_path': ENGINE_OUTPUT_PATH, # Donde guardará el .plan nuevo
-                    'force_engine_update': False,           # Cambia a True si actualizas el ONNX
+                    'force_engine_update': True,           # Cambia a True si actualizas el ONNX
                     # ---------------------------------------
-                    
-                    'input_tensor_names': [INPUT_TENSOR],
-                    'output_tensor_names': [OUTPUT_TENSOR],
+                    'input_tensor_names': ['input_tensor'],
+                    'output_tensor_names': ['output_tensor'],
                     'input_binding_names': [INPUT_TENSOR],
                     'output_binding_names': [OUTPUT_TENSOR],
-                    
-                    # Debugging: Veremos el progreso de compilación en el log
                     'verbose': True 
                 }],
                 remappings=[
@@ -117,26 +113,30 @@ def generate_launch_description():
                     ('tensor_sub', '/tensor_output')
                 ]
             ),
-            
-            # 2. UNet Decoder Node (El Traductor Visual)
+        ],
+        output='screen'
+    )
+
+    # 4. CONTAINER DECODER (Solo la visualización)
+    decoder_container = ComposableNodeContainer(
+        name='decoder_container',
+        namespace='',
+        package='rclcpp_components',
+        executable='component_container',
+        composable_node_descriptions=[
             ComposableNode(
                 package='isaac_ros_unet',
                 plugin='nvidia::isaac_ros::unet::UNetDecoderNode',
                 name='unet_decoder',
                 parameters=[{
-                    'network_output_type': 'sigmoid', # 'sigmoid' para 2 clases, 'argmax' para mas
+                    'network_output_type': 'sigmoid',
                     'color_segmentation_mask_encoding': 'rgb8',
                     'mask_width': NETWORK_WIDTH,
                     'mask_height': NETWORK_HEIGHT,
-                    
-                    # CORRECCIÓN SEGÚN GUÍA 2.1:
-                    # Formato Hexadecimal: [Fondo, Clase1, Clase2...]
-                    # 0x000000 = Negro (Fondo)
-                    # 0x00FF00 = Verde (Carril)
                     'color_palette': [0x000000, 0x00FF00] 
                 }],
                 remappings=[
-                    ('tensor_sub', '/tensor_output'),
+                    ('tensor_sub', '/tensor_decoder_input'), # ENTRADA DESDE EL PYTHON
                     ('unet/raw_segmentation_mask', '/lane_detection/mask_raw'),
                     ('unet/colored_segmentation_mask', '/lane_detection/mask_viz')
                 ]
@@ -145,4 +145,4 @@ def generate_launch_description():
         output='screen'
     )
 
-    return launch.LaunchDescription([resize_container, encoder_container, inference_container])
+    return launch.LaunchDescription([resize_container, encoder_container, inference_container, decoder_container])
