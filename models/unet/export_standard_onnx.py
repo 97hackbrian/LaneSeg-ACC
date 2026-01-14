@@ -6,20 +6,20 @@ import os
 sys.path.append(os.getcwd())
 
 try:
-    from models.unet import UNet
+    from models.unet_depthwise import UNetDepthwise
 except ImportError as e:
-    print("Error importando UNet. Verifica 'models/unet.py'")
+    print("Error importando UNetDepthwise. Verifica 'models/unet_depthwise.py'")
     sys.exit(1)
 
 # --- CONFIGURACIÓN ---
-pth_path = "unet_best.pt"
-onnx_path = "lane_unet.onnx"
+pth_path = "unet_depthwise_best.pt"
+onnx_path = "lane_unet_depthwise.onnx"
 # Dimensiones estáticas (Batch=1)
 input_shape = (1, 3, 256, 256)
 
 print(f"--> Inicializando UNet...")
 device = torch.device("cpu") # Usamos CPU para exportar para evitar ruido de CUDA
-model = UNet(in_channels=3, out_channels=1)
+model = UNetDepthwise(in_channels=3, out_channels=1)
 
 print(f"--> Cargando pesos...")
 try:

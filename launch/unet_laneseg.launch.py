@@ -61,7 +61,7 @@ def generate_launch_description():
                     'network_image_width': NETWORK_WIDTH,
                     'network_image_height': NETWORK_HEIGHT,
                     'image_mean': [0.0, 0.0, 0.0],
-                    'image_stddev': [1.0, 1.0, 1.0],
+                    'image_stddev': [2.5, 2.5, 2.5],
                     'tensor_output_order': 'NHWC',
                     'num_blocks': 40
                 }],
@@ -82,8 +82,8 @@ def generate_launch_description():
     # ---------------------------------------------------------
     # NOTA: Asegúrate de tener el archivo .onnx en esta ruta
     # Si solo tienes el .plan viejo, BÓRRALO. Necesitamos regenerarlo.
-    MODEL_SOURCE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.onnx'
-    ENGINE_OUTPUT_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet.plan'
+    MODEL_SOURCE_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet_depthwise.onnx'
+    ENGINE_OUTPUT_PATH = '/workspaces/isaac_ros-dev/ros2/src/qcar2_LaneSeg-ACC/models/unet/lane_unet_depthwise.plan'
 
     inference_container = ComposableNodeContainer(
         name='inference_container',
@@ -100,7 +100,7 @@ def generate_launch_description():
                     # --- GENERACIÓN AUTOMÁTICA DEL MOTOR ---
                     'model_file_path': MODEL_SOURCE_PATH,   # Le damos el ONNX original
                     'engine_file_path': ENGINE_OUTPUT_PATH, # Donde guardará el .plan nuevo
-                    'force_engine_update': True,           # Cambia a True si actualizas el ONNX
+                    'force_engine_update': False,           # Cambia a True si actualizas el ONNX
                     # ---------------------------------------
                     'input_tensor_names': ['input_tensor'],
                     'output_tensor_names': [OUTPUT_TENSOR],
