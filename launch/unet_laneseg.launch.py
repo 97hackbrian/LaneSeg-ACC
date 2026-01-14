@@ -62,7 +62,7 @@ def generate_launch_description():
                     'network_image_height': NETWORK_HEIGHT,
                     'image_mean': [0.485, 0.456, 0.406],
                     'image_stddev': [0.229, 0.224, 0.225],
-                    'tensor_output_order': 'NCHW',
+                    'tensor_output_order': 'NHWC',
                     'num_blocks': 40
                 }],
                 remappings=[
@@ -110,7 +110,7 @@ def generate_launch_description():
                 }],
                 remappings=[
                     ('tensor_pub', '/tensor_input'),
-                    ('tensor_sub', '/tensor_output')
+                    ('tensor_sub', '/tensor_raw_output')
                 ]
             ),
         ],
