@@ -133,7 +133,7 @@ def generate_launch_description():
                     'color_segmentation_mask_encoding': 'rgb8',
                     'mask_width': NETWORK_WIDTH,
                     'mask_height': NETWORK_HEIGHT,
-                    'color_palette': [0x000000, 0x00FF00] 
+                    'color_palette': [0x00FF00, 0x000000] 
                 }],
                 remappings=[
                     ('tensor_sub', '/tensor_decoder_input'), # ENTRADA DESDE EL PYTHON
