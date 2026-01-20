@@ -50,6 +50,34 @@ python prepare_dataset.py \
   --val-split 0.2
 ```
 
+**Note**: The script will:
+- ✅ Process only images that have corresponding `.json` annotations
+- ⚠️ Ignore images without annotations (will show warning)
+- 📊 Generate train/val/test splits automatically
+
+### Visualization (Jupyter Notebook)
+
+Use `train_unet_notebook.ipynb` for:
+- Interactive dataset exploration
+- Random sample visualization
+- Class distribution analysis
+- Color-coded segmentation overlay
+
+### Programmatic Use
+
+Import functions from `prepare_dataset.py`:
+
+```python
+from prepare_dataset import visualize_mask, overlay_mask_on_image
+import config
+
+# Visualize mask with colors
+colored_mask = visualize_mask(mask, use_colors=True)
+
+# Overlay mask on image
+blended = overlay_mask_on_image(image, mask, alpha=0.5)
+```
+
 ## Class Mapping
 
 | Class ID | Label | Color | Description |

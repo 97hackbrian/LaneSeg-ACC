@@ -20,15 +20,15 @@ import config
 
 
 
-def parse_labelme_json(json_path: str) -> Tuple[List[np.ndarray], List[int], Tuple[int, int]]:
+def parse_labelme_json(json_path: str) -> Tuple[List[np.ndarray], List[str], List[int], Tuple[int, int]]:
     """
-    Parse LabelMe JSON file and extract polygon coordinates and class labels.
+    Parse LabelMe JSON file and extract polygon coordinates, shape types, and class labels.
     
     Args:
         json_path: Path to LabelMe JSON file
         
     Returns:
-        Tuple of (polygon_list, class_list, image_shape)
+        Tuple of (polygon_list, shape_type_list, class_list, image_shape)
     """
     with open(json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
@@ -38,41 +38,92 @@ def parse_labelme_json(json_path: str) -> Tuple[List[np.ndarray], List[int], Tup
     image_shape = (image_height, image_width)
     
     polygons = []
+    shape_types = []
     classes = []
     
     for shape in data.get('shapes', []):
         label = shape['label'].lower().strip()
+        shape_type = shape.get('shape_type', 'polygon')
         points = np.array(shape['points'], dtype=np.int32)
         
         # Map label to class ID using config module
         class_id = config.get_class_id(label, default=0)
         
         polygons.append(points)
+        shape_types.append(shape_type)
         classes.append(class_id)
     
-    return polygons, classes, image_shape
+    return polygons, shape_types, classes, image_shape
 
 
-def create_mask_from_polygons(polygons: List[np.ndarray], classes: List[int], 
-                               image_shape: Tuple[int, int]) -> np.ndarray:
+def create_mask_from_polygons(polygons: List[np.ndarray], shape_types: List[str], classes: List[int], 
+                               image_shape: Tuple[int, int], line_thickness: int = 15) -> np.ndarray:
     """
     Create a segmentation mask from polygon coordinates.
     
     Args:
         polygons: List of polygon coordinates
+        shape_types: List of shape types (polygon, linestrip, etc.)
         classes: List of class IDs for each polygon
         image_shape: (height, width) of the output mask
+        line_thickness: Thickness for drawing lines (for linestrips)
         
     Returns:
         Grayscale mask with pixel values [0, 1, 2, 3]
     """
     mask = np.zeros(image_shape, dtype=np.uint8)
     
-    # Draw polygons in order (later polygons may overlap earlier ones)
-    for polygon, class_id in zip(polygons, classes):
-        cv2.fillPoly(mask, [polygon], color=class_id)
+    # Draw shapes in order (later shapes may overlap earlier ones)
+    for polygon, shape_type, class_id in zip(polygons, shape_types, classes):
+        if shape_type in ['linestrip', 'line']:
+            cv2.polylines(mask, [polygon], isClosed=False, color=class_id, thickness=line_thickness)
+        else:
+            # Default to filled polygon for 'polygon' and others
+            cv2.fillPoly(mask, [polygon], color=class_id)
     
     return mask
+
+
+def visualize_mask(mask: np.ndarray, use_colors: bool = True) -> np.ndarray:
+    """
+    Convert a grayscale mask to colored visualization.
+    
+    Args:
+        mask: Grayscale mask with pixel values [0, 1, 2, 3]
+        use_colors: If True, apply class colors from config
+        
+    Returns:
+        RGB image with colored segmentation
+    """
+    height, width = mask.shape
+    colored_mask = np.zeros((height, width, 3), dtype=np.uint8)
+    
+    if use_colors:
+        for class_id in range(config.NUM_CLASSES):
+            color_bgr = config.get_class_color(class_id, bgr=True)
+            colored_mask[mask == class_id] = color_bgr
+    else:
+        # Grayscale visualization
+        colored_mask = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    
+    return colored_mask
+
+
+def overlay_mask_on_image(image: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    """
+    Overlay colored mask on original image.
+    
+    Args:
+        image: Original BGR image
+        mask: Grayscale mask with pixel values [0, 1, 2, 3]
+        alpha: Transparency factor (0.0 = only image, 1.0 = only mask)
+        
+    Returns:
+        Blended image with mask overlay
+    """
+    colored_mask = visualize_mask(mask, use_colors=True)
+    blended = cv2.addWeighted(image, 1-alpha, colored_mask, alpha, 0)
+    return blended
 
 
 def organize_dataset(input_dir: str, output_dir: str, val_split: float = 0.2, 
@@ -100,23 +151,31 @@ def organize_dataset(input_dir: str, output_dir: str, val_split: float = 0.2,
     print(f"📁 Found {len(json_files)} JSON annotation files")
     
     # Prepare file pairs (image, json)
+    # Only process images that have corresponding JSON annotations
     valid_pairs = []
+    images_without_json = []
     
-    for json_file in json_files:
-        # Try to find corresponding image (png, jpg, jpeg)
-        image_name = json_file.stem
-        image_file = None
+    # Find all images first
+    all_images = []
+    for ext in ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
+        all_images.extend(input_path.glob(ext))
+    
+    # Check each image for corresponding JSON
+    for image_file in all_images:
+        json_file = image_file.parent / f"{image_file.stem}.json"
         
-        for ext in ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG']:
-            candidate = json_file.parent / f"{image_name}{ext}"
-            if candidate.exists():
-                image_file = candidate
-                break
-        
-        if image_file:
+        if json_file.exists():
             valid_pairs.append((image_file, json_file))
         else:
-            print(f"⚠️  Warning: No image found for {json_file.name}")
+            images_without_json.append(image_file.name)
+    
+    # Report images without annotations (these will be ignored)
+    if images_without_json:
+        print(f"\n⚠️  Ignoring {len(images_without_json)} images without JSON annotations:")
+        for img_name in images_without_json[:5]:  # Show first 5
+            print(f"     - {img_name}")
+        if len(images_without_json) > 5:
+            print(f"     ... and {len(images_without_json) - 5} more")
     
     print(f"✅ Found {len(valid_pairs)} valid image-annotation pairs")
     
@@ -178,8 +237,8 @@ def organize_dataset(input_dir: str, output_dir: str, val_split: float = 0.2,
             # Generate and save mask
             if save_masks:
                 try:
-                    polygons, classes, image_shape = parse_labelme_json(str(json_file))
-                    mask = create_mask_from_polygons(polygons, classes, image_shape)
+                    polygons, shape_types, classes, image_shape = parse_labelme_json(str(json_file))
+                    mask = create_mask_from_polygons(polygons, shape_types, classes, image_shape)
                     
                     mask_dest = directories[f'{split_name}_masks'] / new_name
                     cv2.imwrite(str(mask_dest), mask)
