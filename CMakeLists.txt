@@ -13,11 +13,6 @@ find_package(rclpy REQUIRED)
 # Install Python modules
 ament_python_install_package(${PROJECT_NAME})
 
-# Install Python executables (scripts)
-install(PROGRAMS
-  qcar2_laneseg_acc/segformer_decoder_node.py
-  DESTINATION lib/${PROJECT_NAME}
-)
 
 install(PROGRAMS
   qcar2_laneseg_acc/camera_buffer.py
@@ -26,6 +21,11 @@ install(PROGRAMS
 
 install(PROGRAMS
   qcar2_laneseg_acc/tensor_fix.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(PROGRAMS
+  qcar2_laneseg_acc/image_capture_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -68,3 +68,6 @@ models/unet/unet_best.pt
 models/unet/unet_jit.pnnx.param
 models/unet/lane_unet.plan
 models/unet/lane_unet.plan
+
+#dataset
+train_unet/training_data/*
