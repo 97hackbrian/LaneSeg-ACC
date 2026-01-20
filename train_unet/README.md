@@ -22,6 +22,17 @@ This directory contains scripts and utilities for U-Net semantic segmentation tr
   - `val/`: Validation set (images + masks)
   - `test/`: Test set (images only)
 
+### Directory Structure
+```
+train_unet/
+└── training_data
+    ├── dataset_images
+    │   ├── test
+    │   ├── train
+    │   └── val
+    └── raw_images
+```
+
 ## Usage
 
 ### View Configuration

@@ -147,18 +147,21 @@ def organize_dataset(input_dir: str, output_dir: str, val_split: float = 0.2,
     print(f"   Test:  {len(test_pairs)} samples")
     
     # Create directory structure
+    # New structure: output_dir/dataset_images/train, val, test
+    dataset_base = output_path / 'dataset_images'
+    
     directories = {
-        'train_images': output_path / 'train' / 'images',
-        'train_masks': output_path / 'train' / 'masks',
-        'val_images': output_path / 'val' / 'images',
-        'val_masks': output_path / 'val' / 'masks',
-        'test_images': output_path / 'test' / 'images',
+        'train_images': dataset_base / 'train' / 'images',
+        'train_masks': dataset_base / 'train' / 'masks',
+        'val_images': dataset_base / 'val' / 'images',
+        'val_masks': dataset_base / 'val' / 'masks',
+        'test_images': dataset_base / 'test' / 'images',
     }
     
     for dir_path in directories.values():
         dir_path.mkdir(parents=True, exist_ok=True)
     
-    print(f"\n📂 Created directory structure in: {output_path}")
+    print(f"\n📂 Created directory structure in: {dataset_base}")
     
     # Process and copy files
     def process_split(pairs, split_name, save_masks=True):
@@ -206,15 +209,16 @@ def organize_dataset(input_dir: str, output_dir: str, val_split: float = 0.2,
     print(f"\n✅ Dataset preparation complete!")
     print(f"\n📍 Output structure:")
     print(f"   {output_path}/")
-    print(f"   ├── train/")
-    print(f"   │   ├── images/ ({len(train_pairs)} files)")
-    print(f"   │   └── masks/  ({len(train_pairs)} files)")
-    print(f"   ├── val/")
-    print(f"   │   ├── images/ ({len(val_pairs)} files)")
-    print(f"   │   └── masks/  ({len(val_pairs)} files)")
+    print(f"   └── dataset_images/")
+    print(f"       ├── train/")
+    print(f"       │   ├── images/ ({len(train_pairs)} files)")
+    print(f"       │   └── masks/  ({len(train_pairs)} files)")
+    print(f"       ├── val/")
+    print(f"       │   ├── images/ ({len(val_pairs)} files)")
+    print(f"       │   └── masks/  ({len(val_pairs)} files)")
     if test_pairs:
-        print(f"   └── test/")
-        print(f"       └── images/ ({len(test_pairs)} files)")
+        print(f"       └── test/")
+        print(f"           └── images/ ({len(test_pairs)} files)")
     
     print(f"\n💡 Class Mapping Used:")
     for class_id in range(config.NUM_CLASSES):
