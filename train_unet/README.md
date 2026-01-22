@@ -87,10 +87,10 @@ blended = overlay_mask_on_image(image, mask, alpha=0.5)
 
 | Class ID | Label | Color | Description |
 |----------|-------|-------|-------------|
-| 0 | `fondo`, `vereda`, `obstaculo` | Black | Background / Sidewalk / Obstacles |
-| 1 | `camino`, `asfalto`, `road` | Blue | Drivable road / Asphalt |
-| 2 | `linea`, `lane` | Yellow | Traffic lane markings |
-| 3 | `borde`, `edge` | Red | Road edges |
+| 0 | `fondo`, `vereda`, `obstaculo` | Black | sidewalk | id 0
+| 1 | `camino`, `asfalto`, `road` | Blue | road | id 1
+| 2 | `linea`, `lane` | Yellow | lane | id 2
+| 3 | `borde`, `edge` | Red | edge | id 3
 
 ## Future Extensions
 
