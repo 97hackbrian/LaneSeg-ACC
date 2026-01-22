@@ -21,7 +21,8 @@ This directory contains scripts and utilities for U-Net semantic segmentation tr
   - `train/`: Training set (images + masks)
   - `val/`: Validation set (images + masks)
   - `test/`: Test set (images only)
-##Install
+
+## Install
 
   ```bash
   pip install labelme==5.3.1
