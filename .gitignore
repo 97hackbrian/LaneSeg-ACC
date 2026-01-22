@@ -71,3 +71,5 @@ models/unet/lane_unet.plan
 
 #dataset
 train_unet/training_data/*
+
+*.pth
