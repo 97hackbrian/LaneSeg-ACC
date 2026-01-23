@@ -57,7 +57,7 @@ def parse_labelme_json(json_path: str) -> Tuple[List[np.ndarray], List[str], Lis
 
 
 def create_mask_from_polygons(polygons: List[np.ndarray], shape_types: List[str], classes: List[int], 
-                               image_shape: Tuple[int, int], line_thickness: int = 2) -> np.ndarray:
+                               image_shape: Tuple[int, int], line_thickness: int = 1) -> np.ndarray:
     """
     Create a segmentation mask from polygon coordinates.
     
