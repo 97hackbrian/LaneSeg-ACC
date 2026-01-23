@@ -70,6 +70,9 @@ models/unet/lane_unet.plan
 models/unet/lane_unet.plan
 
 #dataset
-train_unet/training_data/*
+train_unet/training_data/dataset_images/*
+train_unet/training_data/raw_images/*
 
 *.pth
+*.plan
+*.onnx
