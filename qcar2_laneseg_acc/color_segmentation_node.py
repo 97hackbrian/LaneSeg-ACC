@@ -62,9 +62,9 @@ class ColorSegmentationNode(Node):
         # =================================================================
         # Parameters
         # =================================================================
-        self.declare_parameter('roi_height_ratio', 0.6)
-        self.declare_parameter('num_samples', 10)
-        self.declare_parameter('sample_region_size', 50)
+        self.declare_parameter('roi_height_ratio', 0.9)
+        self.declare_parameter('num_samples', 5)
+        self.declare_parameter('sample_region_size', 3)
         self.declare_parameter('lut_filename', 'color_lut.npy')
         self.declare_parameter('input_image_topic', '/camera/color_image')
         self.declare_parameter('output_mask_topic', '/segmentation/color_mask')
