@@ -37,7 +37,7 @@ install(PROGRAMS
   qcar2_laneseg_acc/camera_buffer.py
   qcar2_laneseg_acc/tensor_fix.py
   qcar2_laneseg_acc/image_capture_node.py
-  qcar2_laneseg_acc/tensorrt_inference_node.py
+  qcar2_laneseg_acc/color_segmentation_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
