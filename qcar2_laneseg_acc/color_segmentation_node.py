@@ -52,7 +52,7 @@ class ColorSegmentationNode(Node):
         0: (0, 0, 0),       # Sidewalk - Black
         1: (255, 0, 0),     # Road - Blue
         2: (0, 255, 255),   # Lane - Yellow
-        3: (0, 255, 0),     # Road Edge - Green
+        3: (0, 0, 255),     # Road Edge - Green
     }
     
     CLASS_NAMES = ['sidewalk', 'road', 'lane']
@@ -61,7 +61,7 @@ class ColorSegmentationNode(Node):
         super().__init__('color_segmentation_node')
         
         # =================================================================
-        # Parameters
+        # Parameters IR JUGANDO CON ESTOS VALORES
         # =================================================================
         self.declare_parameter('roi_height_ratio', 0.35)
         self.declare_parameter('num_samples', 10)
@@ -74,7 +74,7 @@ class ColorSegmentationNode(Node):
         self.declare_parameter('edge_kernel_size', 3)
         self.declare_parameter('enable_edge_detection', True)  # New: toggle edge detection
         self.declare_parameter('debug_logging', True)  # New: enable debug logs
-        self.declare_parameter('smoothing_sigma', 5.0)  # Gaussian smoothing sigma for LUT generalization
+        self.declare_parameter('smoothing_sigma', 14.0)  # 12-16 Es lo mas estable (probar) Gaussian smoothing sigma for LUT generalization
         
         # Get parameters
         self.roi_height_ratio = self.get_parameter('roi_height_ratio').value
@@ -345,26 +345,33 @@ class ColorSegmentationNode(Node):
         return mask
     
     def _detect_road_edge(self, mask):
-        """Detect edge between sidewalk (0) and road (1)."""
-        # Create binary mask: road vs non-road
+        """
+        Detect edge between sidewalk (0) and road (1).
+        
+        Creates a visible border line where road meets sidewalk by:
+        1. Dilating the road mask to extend it into sidewalk area
+        2. Finding the intersection with the original sidewalk mask
+        """
+        # Create binary masks
         road_mask = (mask == 1).astype(np.uint8) * 255
         sidewalk_mask = (mask == 0).astype(np.uint8) * 255
         
-        # Only detect edges where road meets sidewalk
-        # Use smaller kernel for more precise edges
+        # Kernel for morphological operations
         kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,  # Changed from ELLIPSE for less noise
-            (3, 3)  # Smaller kernel
+            cv2.MORPH_RECT,
+            (self.edge_kernel_size, self.edge_kernel_size)
         )
         
-        # Dilate road slightly
-        road_dilated = cv2.dilate(road_mask, kernel, iterations=1)
+        # Dilate road mask with MORE iterations to create a thicker border
+        # iterations=2 or 3 creates a border of 2-3 pixels wide
+        road_dilated = cv2.dilate(road_mask, kernel, iterations=2)
         
-        # Find where dilated road overlaps with sidewalk
+        # Find where dilated road overlaps with original sidewalk
+        # This is the border region
         road_edge = cv2.bitwise_and(road_dilated, sidewalk_mask)
         
-        # Clean up noise with morphological opening
-        road_edge = cv2.morphologyEx(road_edge, cv2.MORPH_OPEN, kernel)
+        # NO MORPH_OPEN here - it destroys thin lines!
+        # The edge is already clean from the intersection operation
         
         return road_edge > 0
     
