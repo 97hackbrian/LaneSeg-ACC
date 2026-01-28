@@ -22,11 +22,7 @@
     <depend>sensor_msgs</depend>
     <depend>cv_bridge</depend>
 
-    <!-- Isaac ROS Dependencies -->
-    <depend>isaac_ros_tensor_list_interfaces</depend>
-    <depend>isaac_ros_dnn_image_encoder</depend>
-    <depend>isaac_ros_tensor_rt</depend>
-    <depend>isaac_ros_nitros</depend>
+  
 
     <!-- Launch -->
     <exec_depend>launch</exec_depend>
