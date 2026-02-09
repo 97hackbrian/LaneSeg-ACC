@@ -81,7 +81,7 @@ class ColorSegmentationNode(Node):
         self.declare_parameter('output_mask_topic', '/segmentation/color_mask')
         self.declare_parameter('clahe_clip_limit', 1.05)
         self.declare_parameter('clahe_tile_size', 300)
-        self.declare_parameter('edge_kernel_size', 3)
+        self.declare_parameter('edge_kernel_size', 9)
         self.declare_parameter('enable_edge_detection', True)
         self.declare_parameter('debug_logging', True)
         self.declare_parameter('smoothing_sigma', 14.0)
@@ -90,16 +90,16 @@ class ColorSegmentationNode(Node):
         # NEW: Pre-blur (reduce ruido antes de HSV)
         # =================================================================
         self.declare_parameter('enable_pre_blur', True)
-        self.declare_parameter('pre_blur_ksize', 5)     # impar
+        self.declare_parameter('pre_blur_ksize', 7)     # impar (aumentado para reducir oscilación)
         self.declare_parameter('pre_blur_sigma', 0.0)   # 0 = auto
 
         # =================================================================
         # NEW: Robot mask (hide robot parts visible in image)
         # =================================================================
         self.declare_parameter('enable_robot_mask', True)
-        self.declare_parameter('robot_mask_x1', 420)      # Top-left X
+        self.declare_parameter('robot_mask_x1', 400)      # Top-left X
         self.declare_parameter('robot_mask_y1', 430)      # Top-left Y
-        self.declare_parameter('robot_mask_x2', 510)      # Bottom-right X
+        self.declare_parameter('robot_mask_x2', 530)      # Bottom-right X
         self.declare_parameter('robot_mask_y2', 480)      # Bottom-right Y
 
         # =================================================================
@@ -406,9 +406,12 @@ class ColorSegmentationNode(Node):
             cv2.MORPH_RECT,
             (_odd_ksize(self.edge_kernel_size), _odd_ksize(self.edge_kernel_size))
         )
-
         road_dilated = cv2.dilate(road_mask, kernel, iterations=2)
         road_edge = cv2.bitwise_and(road_dilated, sidewalk_mask)
+        
+        # Erosion to remove loose/oscillating edge pixels (use smaller kernel)
+        erosion_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        road_edge = cv2.erode(road_edge, erosion_kernel, iterations=1)
 
         return road_edge > 0
 
@@ -514,10 +517,10 @@ class ColorSegmentationNode(Node):
             if self.enable_pre_blur and self.pre_blur_ksize > 1:
                 roi = cv2.GaussianBlur(roi, (self.pre_blur_ksize, self.pre_blur_ksize), self.pre_blur_sigma)
 
-            # 3) HSV conversion
+            # 2) HSV conversion
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-            # 4) CLAHE normalization
+            # 3) CLAHE normalization
             hsv_normalized = self._apply_clahe(hsv)
 
             if self.calibration_mode:
@@ -528,28 +531,28 @@ class ColorSegmentationNode(Node):
             if self.debug_logging and self.frame_count % 30 == 0:
                 self._debug_log_hsv_stats(hsv_normalized, "Inference")
 
-            # 5) LUT segmentation
+            # 4) LUT segmentation
             mask = self._segment_with_lut(hsv_normalized)
 
             if self.debug_logging and self.frame_count % 30 == 0:
                 self._debug_log_mask_stats(mask)
 
-            # 6) Morphological cleanup
+            # 5) Morphological cleanup
             if self.enable_morph_cleanup:
                 mask = self._morph_cleanup(mask)
 
-            # 7) Edge detection
+            # 6) Edge detection
             if self.enable_edge_detection:
                 road_edge = self._detect_road_edge(mask)
                 mask[road_edge] = 3
 
-            # 8) Colorize and publish
+            # 7) Colorize
             colored_mask = self._colorize_mask(mask)
 
             full_mask = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
             full_mask[crop_offset:, :] = colored_mask
 
-            # 9) Robot mask: zero-fill rectangle region (applied to final output)
+            # 8) Robot mask: zero-fill rectangle region (applied to final output)
             if self.enable_robot_mask:
                 full_mask = self._apply_robot_mask_output(full_mask)
 
