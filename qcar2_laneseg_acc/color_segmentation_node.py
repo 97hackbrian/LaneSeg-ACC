@@ -7,12 +7,14 @@ color classification in HSV space with GPU acceleration via CuPy.
 
 Pipeline:
 1. ROI Crop - Keep bottom portion of image
-2. (Optional) Gaussian Blur - reduce noise
+2. (Optional) Gaussian Blur - Reduce noise before HSV conversion
 3. HSV + CLAHE - Convert to HSV and normalize illumination
 4. LUT Segmentation - Apply precomputed lookup table
-5. (Optional) Road cleanup - keep largest connected road component
+5. (Optional) Morphological Cleanup - Close + Open to remove noise/holes
 6. Edge Detection - Find border between sidewalk and road
-7. Publish segmentation mask
+7. Colorize mask
+8. (Optional) Robot Mask - Zero-fill rectangle in final output (like ROI crop)
+9. Publish segmentation mask
 
 Author: hackbrian (+ improvements)
 """
@@ -92,10 +94,19 @@ class ColorSegmentationNode(Node):
         self.declare_parameter('pre_blur_sigma', 0.0)   # 0 = auto
 
         # =================================================================
-        # NEW: Road cleanup (componente conectado más grande)
+        # NEW: Robot mask (hide robot parts visible in image)
         # =================================================================
-        self.declare_parameter('enable_road_cleanup', True)
-        self.declare_parameter('road_min_area_ratio', 0.03)  # <-- CALIBRA: 0.015 ~ 0.06
+        self.declare_parameter('enable_robot_mask', True)
+        self.declare_parameter('robot_mask_x1', 420)      # Top-left X
+        self.declare_parameter('robot_mask_y1', 430)      # Top-left Y
+        self.declare_parameter('robot_mask_x2', 510)      # Bottom-right X
+        self.declare_parameter('robot_mask_y2', 480)      # Bottom-right Y
+
+        # =================================================================
+        # NEW: Morphological cleanup (Close + Open operations)
+        # =================================================================
+        self.declare_parameter('enable_morph_cleanup', True)
+        self.declare_parameter('morph_kernel_size', 5)  # Kernel size for morphological ops
 
         # Get parameters
         self.roi_height_ratio = float(self.get_parameter('roi_height_ratio').value)
@@ -116,8 +127,16 @@ class ColorSegmentationNode(Node):
         self.pre_blur_ksize = _odd_ksize(self.get_parameter('pre_blur_ksize').value)
         self.pre_blur_sigma = float(self.get_parameter('pre_blur_sigma').value)
 
-        self.enable_road_cleanup = bool(self.get_parameter('enable_road_cleanup').value)
-        self.road_min_area_ratio = float(self.get_parameter('road_min_area_ratio').value)
+        # Robot mask params
+        self.enable_robot_mask = bool(self.get_parameter('enable_robot_mask').value)
+        self.robot_mask_x1 = int(self.get_parameter('robot_mask_x1').value)
+        self.robot_mask_y1 = int(self.get_parameter('robot_mask_y1').value)
+        self.robot_mask_x2 = int(self.get_parameter('robot_mask_x2').value)
+        self.robot_mask_y2 = int(self.get_parameter('robot_mask_y2').value)
+
+        # Morphological cleanup params
+        self.enable_morph_cleanup = bool(self.get_parameter('enable_morph_cleanup').value)
+        self.morph_kernel_size = _odd_ksize(self.get_parameter('morph_kernel_size').value)
 
         # =================================================================
         # Initialize components
@@ -181,7 +200,8 @@ class ColorSegmentationNode(Node):
         self.get_logger().info(f"  Debug logging: {self.debug_logging}")
         self.get_logger().info(f"  Edge detection: {self.enable_edge_detection}")
         self.get_logger().info(f"  Pre-blur: {self.enable_pre_blur} (k={self.pre_blur_ksize}, sigma={self.pre_blur_sigma})")
-        self.get_logger().info(f"  Road cleanup: {self.enable_road_cleanup} (min_area_ratio={self.road_min_area_ratio})")
+        self.get_logger().info(f"  Robot mask: {self.enable_robot_mask} (rect=[{self.robot_mask_x1},{self.robot_mask_y1}]-[{self.robot_mask_x2},{self.robot_mask_y2}])")
+        self.get_logger().info(f"  Morph cleanup: {self.enable_morph_cleanup} (kernel={self.morph_kernel_size})")
 
     # =====================================================================
     # Debug Functions
@@ -326,27 +346,53 @@ class ColorSegmentationNode(Node):
 
         return mask
 
-    def _cleanup_road_largest_component(self, mask: np.ndarray) -> np.ndarray:
+    def _apply_robot_mask_output(self, full_mask: np.ndarray) -> np.ndarray:
         """
-        Mantiene como ROAD solo el componente conectado más grande.
-        Quita islitas/ruido de road en la acera y viceversa.
+        Zero-fill a rectangular region in the final output mask.
+        The rectangle is defined by two corner points: (x1,y1) to (x2,y2).
+        Coordinates are in GLOBAL image space (original image).
+        This completely ignores the region, similar to how ROI crop ignores the top.
         """
-        road = (mask == 1).astype(np.uint8)  # 0/1
-        num, labels, stats, _ = cv2.connectedComponentsWithStats(road, connectivity=8)
-        if num <= 1:
-            return mask
+        h, w = full_mask.shape[:2]
+        
+        # Clamp to image bounds (using global coordinates directly)
+        x1 = max(0, min(self.robot_mask_x1, w))
+        x2 = max(0, min(self.robot_mask_x2, w))
+        y1 = max(0, min(self.robot_mask_y1, h))
+        y2 = max(0, min(self.robot_mask_y2, h))
+        
+        if x2 > x1 and y2 > y1:
+            full_mask[y1:y2, x1:x2] = 0  # Set to black (ignored)
+        
+        return full_mask
 
-        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        biggest_area = int(stats[biggest, cv2.CC_STAT_AREA])
-
-        min_area = int(max(1, self.road_min_area_ratio) * road.size)
-        if biggest_area < min_area:
-            # Muy pequeño o mal detectado -> mejor no tocar este frame
-            return mask
-
-        road_clean = (labels == biggest)
-        mask[(mask == 1) & (~road_clean)] = 0
-        return mask
+    def _morph_cleanup(self, mask: np.ndarray) -> np.ndarray:
+        """
+        Apply morphological operations to clean up the segmentation mask.
+        Close (fill holes) + Open (remove noise) on the road class.
+        """
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (self.morph_kernel_size, self.morph_kernel_size)
+        )
+        
+        # Process road class (label=1)
+        road = (mask == 1).astype(np.uint8) * 255
+        # Close: fill small holes in road
+        road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # Open: remove small noise/islands
+        road = cv2.morphologyEx(road, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        # Update mask: where road was cleaned, keep road; elsewhere restore original
+        road_cleaned = road > 0
+        # Keep lanes (label=2) untouched
+        lane_mask = mask == 2
+        # Final mask: sidewalk (0) by default, then overlay road and lanes
+        result = np.zeros_like(mask)
+        result[road_cleaned] = 1
+        result[lane_mask] = 2
+        
+        return result
 
     def _detect_road_edge(self, mask):
         """
@@ -464,14 +510,14 @@ class ColorSegmentationNode(Node):
 
             roi, crop_offset = self._crop_roi(frame)
 
-            # NEW: pre-blur
+            # 1) Pre-blur: reduce noise
             if self.enable_pre_blur and self.pre_blur_ksize > 1:
                 roi = cv2.GaussianBlur(roi, (self.pre_blur_ksize, self.pre_blur_ksize), self.pre_blur_sigma)
 
-            # 1) HSV
+            # 3) HSV conversion
             hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-            # 2) CLAHE normalization
+            # 4) CLAHE normalization
             hsv_normalized = self._apply_clahe(hsv)
 
             if self.calibration_mode:
@@ -482,26 +528,30 @@ class ColorSegmentationNode(Node):
             if self.debug_logging and self.frame_count % 30 == 0:
                 self._debug_log_hsv_stats(hsv_normalized, "Inference")
 
-            # 3) LUT segmentation
+            # 5) LUT segmentation
             mask = self._segment_with_lut(hsv_normalized)
 
             if self.debug_logging and self.frame_count % 30 == 0:
                 self._debug_log_mask_stats(mask)
 
-            # 4) NEW: road cleanup
-            if self.enable_road_cleanup:
-                mask = self._cleanup_road_largest_component(mask)
+            # 6) Morphological cleanup
+            if self.enable_morph_cleanup:
+                mask = self._morph_cleanup(mask)
 
-            # 5) Edge detection
+            # 7) Edge detection
             if self.enable_edge_detection:
                 road_edge = self._detect_road_edge(mask)
                 mask[road_edge] = 3
 
-            # 6) Colorize
+            # 8) Colorize and publish
             colored_mask = self._colorize_mask(mask)
 
             full_mask = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
             full_mask[crop_offset:, :] = colored_mask
+
+            # 9) Robot mask: zero-fill rectangle region (applied to final output)
+            if self.enable_robot_mask:
+                full_mask = self._apply_robot_mask_output(full_mask)
 
             mask_msg = self.bridge.cv2_to_imgmsg(full_mask, encoding='bgr8')
             mask_msg.header = msg.header
