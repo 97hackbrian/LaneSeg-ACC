@@ -107,6 +107,7 @@ class ColorSegmentationNode(Node):
         # =================================================================
         self.declare_parameter('enable_morph_cleanup', True)
         self.declare_parameter('morph_kernel_size', 7)  # Kernel size for morphological ops
+        self.declare_parameter('lane_dilate_size', 5)   # Lane dilation kernel size (0=disabled)
 
         # Get parameters
         self.roi_height_ratio = float(self.get_parameter('roi_height_ratio').value)
@@ -137,6 +138,7 @@ class ColorSegmentationNode(Node):
         # Morphological cleanup params
         self.enable_morph_cleanup = bool(self.get_parameter('enable_morph_cleanup').value)
         self.morph_kernel_size = _odd_ksize(self.get_parameter('morph_kernel_size').value)
+        self.lane_dilate_size = _odd_ksize(self.get_parameter('lane_dilate_size').value)
 
         # =================================================================
         # Initialize components
@@ -370,6 +372,7 @@ class ColorSegmentationNode(Node):
         """
         Apply morphological operations to clean up the segmentation mask.
         Close (fill holes) + Open (remove noise) on the road class.
+        Dilate lanes to make them thicker.
         """
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -382,15 +385,23 @@ class ColorSegmentationNode(Node):
         road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, kernel, iterations=1)
         # Open: remove small noise/islands
         road = cv2.morphologyEx(road, cv2.MORPH_OPEN, kernel, iterations=1)
-        
-        # Update mask: where road was cleaned, keep road; elsewhere restore original
         road_cleaned = road > 0
-        # Keep lanes (label=2) untouched
-        lane_mask = mask == 2
+        
+        # Process lane class (label=2) - dilate to make thicker
+        lane = (mask == 2).astype(np.uint8) * 255
+        if self.lane_dilate_size > 1:
+            lane_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (self.lane_dilate_size, self.lane_dilate_size)
+            )
+            lane = cv2.dilate(lane, lane_kernel, iterations=1)
+        lane_dilated = lane > 0
+        
         # Final mask: sidewalk (0) by default, then overlay road and lanes
+        # Lanes have priority over road
         result = np.zeros_like(mask)
         result[road_cleaned] = 1
-        result[lane_mask] = 2
+        result[lane_dilated] = 2
         
         return result
 
