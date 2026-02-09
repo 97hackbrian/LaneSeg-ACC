@@ -16,7 +16,7 @@ Pipeline:
 8. (Optional) Robot Mask - Zero-fill rectangle in final output (like ROI crop)
 9. Publish segmentation mask
 
-Author: hackbrian (+ improvements)
+Author: hackbrian (+ improvements Eduardex)
 """
 
 import rclpy
@@ -73,7 +73,7 @@ class ColorSegmentationNode(Node):
         # =================================================================
         # Parameters IR JUGANDO CON ESTOS VALORES
         # =================================================================
-        self.declare_parameter('roi_height_ratio', 0.35)
+        self.declare_parameter('roi_height_ratio', 0.4)
         self.declare_parameter('num_samples', 10)
         self.declare_parameter('sample_region_size', 4)
         self.declare_parameter('lut_filename', 'color_lut.npy')
@@ -81,7 +81,7 @@ class ColorSegmentationNode(Node):
         self.declare_parameter('output_mask_topic', '/segmentation/color_mask')
         self.declare_parameter('clahe_clip_limit', 1.05)
         self.declare_parameter('clahe_tile_size', 300)
-        self.declare_parameter('edge_kernel_size', 9)
+        self.declare_parameter('edge_kernel_size', 11)
         self.declare_parameter('enable_edge_detection', True)
         self.declare_parameter('debug_logging', True)
         self.declare_parameter('smoothing_sigma', 14.0)
@@ -90,7 +90,7 @@ class ColorSegmentationNode(Node):
         # NEW: Pre-blur (reduce ruido antes de HSV)
         # =================================================================
         self.declare_parameter('enable_pre_blur', True)
-        self.declare_parameter('pre_blur_ksize', 7)     # impar (aumentado para reducir oscilación)
+        self.declare_parameter('pre_blur_ksize', 9)     # impar (aumentado para reducir oscilación)
         self.declare_parameter('pre_blur_sigma', 0.0)   # 0 = auto
 
         # =================================================================
@@ -106,7 +106,7 @@ class ColorSegmentationNode(Node):
         # NEW: Morphological cleanup (Close + Open operations)
         # =================================================================
         self.declare_parameter('enable_morph_cleanup', True)
-        self.declare_parameter('morph_kernel_size', 5)  # Kernel size for morphological ops
+        self.declare_parameter('morph_kernel_size', 7)  # Kernel size for morphological ops
 
         # Get parameters
         self.roi_height_ratio = float(self.get_parameter('roi_height_ratio').value)
