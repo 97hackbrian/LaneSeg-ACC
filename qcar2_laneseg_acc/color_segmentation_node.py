@@ -85,6 +85,7 @@ class ColorSegmentationNode(Node):
         self.declare_parameter('enable_edge_detection', True)
         self.declare_parameter('debug_logging', True)
         self.declare_parameter('smoothing_sigma', 14.0)
+        self.declare_parameter('lut_dir', '')  # Override: path to config dir for LUT
 
         # =================================================================
         # NEW: Pre-blur (reduce ruido antes de HSV)
@@ -162,9 +163,30 @@ class ColorSegmentationNode(Node):
         # Debug counter
         self.frame_count = 0
 
-        # Find package paths
-        self.pkg_share_dir = get_package_share_directory('qcar2_laneseg_acc')
-        self.lut_path = os.path.join(self.pkg_share_dir, 'config', self.lut_filename)
+        # =================================================================
+        # Resolve LUT config directory (source > share fallback)
+        # =================================================================
+        lut_dir_param = str(self.get_parameter('lut_dir').value)
+
+        if lut_dir_param:
+            # User explicitly provided the config directory
+            self._config_dir = lut_dir_param
+            self.get_logger().info(f"Using user-provided LUT dir: {self._config_dir}")
+        else:
+            # Auto-detect source config directory from colcon workspace
+            source_config = self._find_source_config_dir()
+            if source_config:
+                self._config_dir = source_config
+                self.get_logger().info(f"Auto-detected source config: {self._config_dir}")
+            else:
+                # Fallback to install share directory
+                pkg_share = get_package_share_directory('qcar2_laneseg_acc')
+                self._config_dir = os.path.join(pkg_share, 'config')
+                self.get_logger().warn(
+                    f"Could not find source config dir, using share: {self._config_dir}"
+                )
+
+        self.lut_path = os.path.join(self._config_dir, self.lut_filename)
 
         # Try to load existing LUT
         if self._load_lut():
@@ -204,6 +226,49 @@ class ColorSegmentationNode(Node):
         self.get_logger().info(f"  Pre-blur: {self.enable_pre_blur} (k={self.pre_blur_ksize}, sigma={self.pre_blur_sigma})")
         self.get_logger().info(f"  Robot mask: {self.enable_robot_mask} (rect=[{self.robot_mask_x1},{self.robot_mask_y1}]-[{self.robot_mask_x2},{self.robot_mask_y2}])")
         self.get_logger().info(f"  Morph cleanup: {self.enable_morph_cleanup} (kernel={self.morph_kernel_size})")
+
+    # =====================================================================
+    # Source Directory Auto-Detection
+    # =====================================================================
+    def _find_source_config_dir(self):
+        """
+        Auto-detect the source config/ directory from the colcon workspace.
+
+        Strategy:
+          1. Get installed share path via get_package_share_directory()
+             e.g. <ws>/install/<pkg>/share/<pkg>
+          2. Go up 4 levels to reach the workspace root <ws>/
+          3. Scan <ws>/src/ for a package.xml containing our package name
+          4. Return <source_pkg_dir>/config/
+        """
+        try:
+            share_dir = get_package_share_directory('qcar2_laneseg_acc')
+            # share_dir = <ws>/install/<pkg>/share/<pkg>
+            # Navigate up 4 levels: share/<pkg> -> share -> <pkg> -> install -> <ws>
+            ws_root = share_dir
+            for _ in range(4):
+                ws_root = os.path.dirname(ws_root)
+
+            src_dir = os.path.join(ws_root, 'src')
+            if not os.path.isdir(src_dir):
+                return None
+
+            # Walk src/ (max depth 2) looking for our package.xml
+            for root, dirs, files in os.walk(src_dir):
+                depth = root[len(src_dir):].count(os.sep)
+                if depth >= 2:
+                    dirs.clear()
+                    continue
+                if 'package.xml' in files:
+                    pkg_xml_path = os.path.join(root, 'package.xml')
+                    with open(pkg_xml_path, 'r') as f:
+                        if '<name>qcar2_laneseg_acc</name>' in f.read():
+                            config_dir = os.path.join(root, 'config')
+                            os.makedirs(config_dir, exist_ok=True)
+                            return config_dir
+        except Exception as e:
+            self.get_logger().warn(f"Source config auto-detection failed: {e}")
+        return None
 
     # =====================================================================
     # Debug Functions
