@@ -49,3 +49,30 @@ qtcreator-*
 
 # Catkin custom files
 CATKIN_IGNORE
+
+
+core
+*.ply
+*.onnx
+*.plan
+*.pt
+
+*.zip
+/oficial
+
+models/oficial/labels.txt
+models/oficial/nvinfer_config.txt
+models/segformer/oficial/labels.txt
+models/segformer/oficial/nvinfer_config.txt
+models/unet/unet_best.pt
+models/unet/unet_jit.pnnx.param
+models/unet/lane_unet.plan
+models/unet/lane_unet.plan
+
+#dataset
+train_unet/training_data/dataset_images/*
+train_unet/training_data/raw_images/*
+
+*.pth
+*.plan
+*.onnx
