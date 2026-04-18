@@ -22,8 +22,8 @@ Author: hackbrian (+ improvements Eduardex)
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
+from rcl_interfaces.msg import SetParametersResult
+from sensor_msgs.msg import CompressedImage
 import cv2
 import numpy as np
 import os
@@ -74,13 +74,13 @@ class ColorSegmentationNode(Node):
         # Parameters IR JUGANDO CON ESTOS VALORES
         # =================================================================
         self.declare_parameter('roi_height_ratio', 0.4)
-        self.declare_parameter('num_samples', 10)
-        self.declare_parameter('sample_region_size', 4)
+        self.declare_parameter('brush_size', 8)  # Radius of paint brush for calibration
         self.declare_parameter('lut_filename', 'color_lut.npy')
-        self.declare_parameter('input_image_topic', '/camera/color_image')
-        self.declare_parameter('output_mask_topic', '/segmentation/color_mask')
+        self.declare_parameter('input_image_topic', '/camera/color_image/compressed')
+        self.declare_parameter('output_mask_topic', '/segmentation/color_mask/compressed')
+        self.declare_parameter('jpeg_quality', 10)  # 1-100, lower = more compression
         self.declare_parameter('clahe_clip_limit', 1.05)
-        self.declare_parameter('clahe_tile_size', 300)
+        self.declare_parameter('clahe_tile_size', 125)
         self.declare_parameter('edge_kernel_size', 11)
         self.declare_parameter('enable_edge_detection', True)
         self.declare_parameter('debug_logging', True)
@@ -112,8 +112,7 @@ class ColorSegmentationNode(Node):
 
         # Get parameters
         self.roi_height_ratio = float(self.get_parameter('roi_height_ratio').value)
-        self.num_samples = int(self.get_parameter('num_samples').value)
-        self.sample_region_size = int(self.get_parameter('sample_region_size').value)
+        self.brush_size = int(self.get_parameter('brush_size').value)
         self.lut_filename = str(self.get_parameter('lut_filename').value)
         input_topic = str(self.get_parameter('input_image_topic').value)
         output_topic = str(self.get_parameter('output_mask_topic').value)
@@ -123,6 +122,7 @@ class ColorSegmentationNode(Node):
         self.enable_edge_detection = bool(self.get_parameter('enable_edge_detection').value)
         self.debug_logging = bool(self.get_parameter('debug_logging').value)
         self.smoothing_sigma = float(self.get_parameter('smoothing_sigma').value)
+        self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
 
         # New params
         self.enable_pre_blur = bool(self.get_parameter('enable_pre_blur').value)
@@ -144,7 +144,6 @@ class ColorSegmentationNode(Node):
         # =================================================================
         # Initialize components
         # =================================================================
-        self.bridge = CvBridge()
         self.clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile_size, tile_size))
 
         # LUT storage (will be loaded or generated)
@@ -155,10 +154,12 @@ class ColorSegmentationNode(Node):
         self.calibration_mode = False
         self.calibration_data = {cls: [] for cls in self.CLASS_NAMES}
         self.current_class_idx = 0
-        self.samples_collected = 0
         self.calibration_frame_hsv = None
         self.calibration_frame_display = None
         self.mouse_pos = (0, 0)
+        self._painting = False          # True while left-button is held
+        self._paint_mask = None         # Binary mask of painted pixels
+        self._stroke_history = []       # List of masks for undo support
 
         # Debug counter
         self.frame_count = 0
@@ -214,8 +215,8 @@ class ColorSegmentationNode(Node):
         # =================================================================
         # Subscriber and Publisher
         # =================================================================
-        self.sub = self.create_subscription(Image, input_topic, self.image_callback, qos_input)
-        self.pub = self.create_publisher(Image, output_topic, qos_output)
+        self.sub = self.create_subscription(CompressedImage, input_topic, self.image_callback, qos_input)
+        self.pub = self.create_publisher(CompressedImage, output_topic, qos_output)
 
         self.get_logger().info("Color Segmentation Node started")
         self.get_logger().info(f"  Input: {input_topic}")
@@ -226,6 +227,93 @@ class ColorSegmentationNode(Node):
         self.get_logger().info(f"  Pre-blur: {self.enable_pre_blur} (k={self.pre_blur_ksize}, sigma={self.pre_blur_sigma})")
         self.get_logger().info(f"  Robot mask: {self.enable_robot_mask} (rect=[{self.robot_mask_x1},{self.robot_mask_y1}]-[{self.robot_mask_x2},{self.robot_mask_y2}])")
         self.get_logger().info(f"  Morph cleanup: {self.enable_morph_cleanup} (kernel={self.morph_kernel_size})")
+
+        # =================================================================
+        # Dynamic Parameter Reconfiguration
+        # =================================================================
+        self.add_on_set_parameters_callback(self._parameter_callback)
+
+    # =====================================================================
+    # Dynamic Parameter Callback
+    # =====================================================================
+    def _parameter_callback(self, params):
+        """
+        Called whenever a parameter is changed at runtime (e.g. via rqt).
+        Updates the corresponding instance variable so the pipeline uses
+        the new value on the next frame.  Topic / LUT-path parameters are
+        read-only at runtime because they require a full restart.
+        """
+        for param in params:
+            name = param.name
+            value = param.value
+
+            # --- ROI / General ---
+            if name == 'roi_height_ratio':
+                self.roi_height_ratio = float(value)
+            elif name == 'smoothing_sigma':
+                self.smoothing_sigma = float(value)
+            elif name == 'debug_logging':
+                self.debug_logging = bool(value)
+
+            # --- CLAHE (needs object recreation) ---
+            elif name == 'clahe_clip_limit':
+                clip = float(value)
+                tile = int(self.get_parameter('clahe_tile_size').value)
+                self.clahe = cv2.createCLAHE(
+                    clipLimit=clip, tileGridSize=(tile, tile)
+                )
+            elif name == 'clahe_tile_size':
+                tile = int(value)
+                clip = float(self.get_parameter('clahe_clip_limit').value)
+                self.clahe = cv2.createCLAHE(
+                    clipLimit=clip, tileGridSize=(tile, tile)
+                )
+
+            # --- Edge detection ---
+            elif name == 'edge_kernel_size':
+                self.edge_kernel_size = int(value)
+            elif name == 'enable_edge_detection':
+                self.enable_edge_detection = bool(value)
+
+            # --- Pre-blur ---
+            elif name == 'enable_pre_blur':
+                self.enable_pre_blur = bool(value)
+            elif name == 'pre_blur_ksize':
+                self.pre_blur_ksize = _odd_ksize(value)
+            elif name == 'pre_blur_sigma':
+                self.pre_blur_sigma = float(value)
+
+            # --- Robot mask ---
+            elif name == 'enable_robot_mask':
+                self.enable_robot_mask = bool(value)
+            elif name == 'robot_mask_x1':
+                self.robot_mask_x1 = int(value)
+            elif name == 'robot_mask_y1':
+                self.robot_mask_y1 = int(value)
+            elif name == 'robot_mask_x2':
+                self.robot_mask_x2 = int(value)
+            elif name == 'robot_mask_y2':
+                self.robot_mask_y2 = int(value)
+
+            # --- Morphological cleanup ---
+            elif name == 'enable_morph_cleanup':
+                self.enable_morph_cleanup = bool(value)
+            elif name == 'morph_kernel_size':
+                self.morph_kernel_size = _odd_ksize(value)
+            elif name == 'lane_dilate_size':
+                self.lane_dilate_size = _odd_ksize(value)
+
+            # --- Output compression ---
+            elif name == 'jpeg_quality':
+                self.jpeg_quality = max(1, min(100, int(value)))
+
+            # --- Calibration ---
+            elif name == 'brush_size':
+                self.brush_size = max(1, int(value))
+
+            self.get_logger().info(f"Parameter '{name}' updated to: {value}")
+
+        return SetParametersResult(successful=True)
 
     # =====================================================================
     # Source Directory Auto-Detection
@@ -499,43 +587,65 @@ class ColorSegmentationNode(Node):
         return colored
 
     # =====================================================================
-    # Calibration GUI
+    # Calibration GUI  (Paint-based)
     # =====================================================================
-    def _mouse_callback(self, event, x, y, flags, param):
-        self.mouse_pos = (x, y)
-        if event == cv2.EVENT_LBUTTONDOWN:
-            if self.calibration_frame_hsv is not None:
-                self._collect_sample(x, y)
-
-    def _collect_sample(self, x, y):
-        half_size = self.sample_region_size // 2
-
+    def _collect_painted_pixels(self, x, y):
+        """Collect HSV values under the brush circle and add them immediately."""
+        if self.calibration_frame_hsv is None or self._paint_mask is None:
+            return
         h, w = self.calibration_frame_hsv.shape[:2]
-        x1 = max(0, x - half_size)
-        x2 = min(w, x + half_size)
-        y1 = max(0, y - half_size)
-        y2 = min(h, y + half_size)
-
-        hsv_region = self.calibration_frame_hsv[y1:y2, x1:x2]
-        hsv_pixels = hsv_region.reshape(-1, 3)
-
+        # Build a temporary mask for just this brush stamp
+        stamp = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(stamp, (x, y), self.brush_size, 255, -1)
+        # Only collect NEW pixels (not already painted)
+        new_pixels = (stamp > 0) & (self._paint_mask == 0)
+        if not np.any(new_pixels):
+            return
+        hsv_pixels = self.calibration_frame_hsv[new_pixels]
         current_class = self.CLASS_NAMES[self.current_class_idx]
         self.calibration_data[current_class].append(hsv_pixels)
-        self.samples_collected += 1
 
-        h_vals, s_vals, v_vals = hsv_pixels[:, 0], hsv_pixels[:, 1], hsv_pixels[:, 2]
+    def _mouse_callback(self, event, x, y, flags, param):
+        self.mouse_pos = (x, y)
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._painting = True
+            # Start a new stroke: save a snapshot of the current mask
+            if self._paint_mask is not None:
+                self._stroke_history.append(self._paint_mask.copy())
+            # Collect data & paint first dot
+            self._collect_painted_pixels(x, y)
+            if self._paint_mask is not None:
+                cv2.circle(self._paint_mask, (x, y), self.brush_size, 255, -1)
+
+        elif event == cv2.EVENT_MOUSEMOVE and self._painting:
+            self._collect_painted_pixels(x, y)
+            if self._paint_mask is not None:
+                cv2.circle(self._paint_mask, (x, y), self.brush_size, 255, -1)
+
+        elif event == cv2.EVENT_LBUTTONUP:
+            self._painting = False
+
+    def _advance_class(self):
+        """Advance to the next class (ENTER key). Data was already collected while painting."""
+        current_class = self.CLASS_NAMES[self.current_class_idx]
+        total_px = sum(len(s) for s in self.calibration_data[current_class])
+
+        if total_px == 0:
+            self.get_logger().warn("No pixels painted — paint a region first.")
+            return
+
         self.get_logger().info(
-            f"Sample {self.samples_collected}/{self.num_samples} for '{current_class}': "
-            f"{len(hsv_pixels)} pixels, H=[{h_vals.min()}-{h_vals.max()}], "
-            f"S=[{s_vals.min()}-{s_vals.max()}], V=[{v_vals.min()}-{v_vals.max()}]"
+            f"Class '{current_class}' done: {total_px} px collected."
         )
 
-        if self.samples_collected >= self.num_samples:
-            self.samples_collected = 0
-            self.current_class_idx += 1
+        # Advance to the next class
+        self.current_class_idx += 1
+        self._paint_mask[:] = 0
+        self._stroke_history.clear()
 
-            if self.current_class_idx >= len(self.CLASS_NAMES):
-                self._finish_calibration()
+        if self.current_class_idx >= len(self.CLASS_NAMES):
+            self._finish_calibration()
 
     def _finish_calibration(self):
         self.get_logger().info("Calibration complete! Generating LUT...")
@@ -543,37 +653,83 @@ class ColorSegmentationNode(Node):
         self._generate_lut()
         self._save_lut()
         self.calibration_mode = False
+        self._paint_mask = None
+        self._stroke_history.clear()
         self.get_logger().info("Ready for segmentation!")
 
     def _run_calibration_gui(self, roi_bgr, hsv_normalized):
         self.calibration_frame_hsv = hsv_normalized.copy()
         self.calibration_frame_display = roi_bgr.copy()
+
+        h, w = roi_bgr.shape[:2]
+
+        # Lazy-init paint mask to image size
+        if self._paint_mask is None or self._paint_mask.shape[:2] != (h, w):
+            self._paint_mask = np.zeros((h, w), dtype=np.uint8)
+            self._stroke_history.clear()
+
+        # --- Build display ---
         display = roi_bgr.copy()
 
-        half_size = self.sample_region_size // 2
-        x, y = self.mouse_pos
-        cv2.rectangle(
-            display,
-            (x - half_size, y - half_size),
-            (x + half_size, y + half_size),
-            (0, 255, 0), 2
-        )
+        # Draw paint overlay (semi-transparent highlight)
+        if self._paint_mask is not None:
+            current_class = self.CLASS_NAMES[self.current_class_idx]
+            overlay_color = self.MASK_COLORS.get(self.current_class_idx, (0, 255, 0))
+            # White overlay for sidewalk (black class) so the paint is visible
+            if current_class == 'sidewalk':
+                overlay_color = (180, 180, 180)
+            overlay = display.copy()
+            overlay[self._paint_mask > 0] = overlay_color
+            cv2.addWeighted(overlay, 0.45, display, 0.55, 0, display)
 
+        # Draw brush cursor
+        x, y = self.mouse_pos
+        cv2.circle(display, (x, y), self.brush_size, (0, 255, 0), 1)
+
+        # --- HUD text ---
         current_class = self.CLASS_NAMES[self.current_class_idx]
         color = self.MASK_COLORS[self.current_class_idx]
         text_color = (255, 255, 255) if current_class == 'sidewalk' else color
+        num_painted = int((self._paint_mask > 0).sum()) if self._paint_mask is not None else 0
 
-        text = f"Click on {current_class.upper()} ({self.samples_collected}/{self.num_samples})"
-        cv2.putText(display, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, text_color, 2)
-        cv2.putText(display, "Press 'q' to cancel", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
-        cv2.putText(display, f"Sample size: {self.sample_region_size}x{self.sample_region_size}px",
-                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(display,
+                    f"Paint: {current_class.upper()}  ({num_painted} px)",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+        cv2.putText(display,
+                    "ENTER=confirm | c=clear | u=undo | +/-=brush | q=quit",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+        cv2.putText(display,
+                    f"Class {self.current_class_idx + 1}/{len(self.CLASS_NAMES)}  "
+                    f"brush={self.brush_size}px",
+                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         cv2.imshow("Calibration", display)
         cv2.setMouseCallback("Calibration", self._mouse_callback)
 
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+
+        if key == 13:  # ENTER — advance to next class
+            self._advance_class()
+        elif key == ord('c'):  # Clear canvas, keep data, continue same class
+            current_class = self.CLASS_NAMES[self.current_class_idx]
+            total_px = sum(len(s) for s in self.calibration_data[current_class])
+            self._paint_mask[:] = 0
+            self._stroke_history.clear()
+            self.get_logger().info(
+                f"Canvas cleared — {total_px} px saved for '{current_class}'. "
+                f"Keep painting to add more."
+            )
+        elif key == ord('u'):  # Undo last stroke
+            if self._stroke_history:
+                self._paint_mask = self._stroke_history.pop()
+                self.get_logger().info("Undo stroke.")
+            else:
+                self.get_logger().info("Nothing to undo.")
+        elif key == ord('+') or key == ord('='):  # Increase brush
+            self.brush_size = min(100, self.brush_size + 2)
+        elif key == ord('-'):  # Decrease brush
+            self.brush_size = max(1, self.brush_size - 2)
+        elif key == ord('q'):
             self.get_logger().warn("Calibration cancelled")
             cv2.destroyAllWindows()
             rclpy.shutdown()
@@ -583,7 +739,13 @@ class ColorSegmentationNode(Node):
     # =====================================================================
     def image_callback(self, msg):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            # Decode compressed image
+            if not msg.data:
+                return
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            if np_arr.size == 0:
+                return
+            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is None or frame.size == 0:
                 return
 
@@ -632,9 +794,15 @@ class ColorSegmentationNode(Node):
             if self.enable_robot_mask:
                 full_mask = self._apply_robot_mask_output(full_mask)
 
-            mask_msg = self.bridge.cv2_to_imgmsg(full_mask, encoding='bgr8')
-            mask_msg.header = msg.header
-            self.pub.publish(mask_msg)
+            # 9) Publish as CompressedImage (JPEG, max compression)
+            encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
+            _, compressed_data = cv2.imencode('.jpg', full_mask, encode_params)
+
+            out_msg = CompressedImage()
+            out_msg.header = msg.header
+            out_msg.format = 'jpeg'
+            out_msg.data = compressed_data.tobytes()
+            self.pub.publish(out_msg)
 
         except Exception as e:
             self.get_logger().error(f"Processing error: {e}")
