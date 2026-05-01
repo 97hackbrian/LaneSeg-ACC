@@ -46,6 +46,108 @@ def _odd_ksize(k: int) -> int:
     return k if (k % 2 == 1) else (k + 1)
 
 
+# =========================================================================
+# Adaptive Gamma Correction (AGCWD) — from adaptgamma.py
+# =========================================================================
+def _image_agcwd(img_u8: np.ndarray, a: float = 0.25, truncated_cdf: bool = False) -> np.ndarray:
+    """AGCWD sobre imagen uint8 de un canal."""
+    if img_u8.dtype != np.uint8:
+        img_u8 = np.clip(img_u8, 0, 255).astype(np.uint8)
+
+    hist = cv2.calcHist([img_u8], [0], None, [256], [0, 256]).flatten().astype(np.float64)
+    total = hist.sum()
+    if total <= 0:
+        return img_u8.copy()
+
+    prob = hist / total
+    prob_min = prob.min()
+    prob_max = prob.max()
+    if abs(prob_max - prob_min) < 1e-12:
+        return img_u8.copy()
+
+    pn_temp = (prob - prob_min) / (prob_max - prob_min)
+    pos_mask = pn_temp >= 0
+    neg_mask = ~pos_mask
+
+    pn_wd = np.zeros_like(pn_temp)
+    pn_wd[pos_mask] = prob_max * np.power(pn_temp[pos_mask], a)
+    pn_wd[neg_mask] = prob_max * (-np.power(-pn_temp[neg_mask], a))
+
+    s = pn_wd.sum()
+    if abs(s) < 1e-12:
+        return img_u8.copy()
+
+    prob_wd = pn_wd / s
+    cdf_wd = np.cumsum(prob_wd)
+
+    if truncated_cdf:
+        inverse_cdf = np.maximum(0.5, 1.0 - cdf_wd)
+    else:
+        inverse_cdf = 1.0 - cdf_wd
+
+    lut = np.arange(256, dtype=np.float64)
+    lut = np.round(255.0 * np.power(lut / 255.0, inverse_cdf))
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+    return cv2.LUT(img_u8, lut)
+
+
+def _process_bright(img_u8: np.ndarray, a_val: float = 0.6) -> np.ndarray:
+    """Para imágenes muy brillantes."""
+    img_negative = 255 - img_u8
+    agcwd_neg = _image_agcwd(img_negative, a=a_val, truncated_cdf=False)
+    return 255 - agcwd_neg
+
+
+def _process_dimmed(img_u8: np.ndarray, a_val: float = 0.75) -> np.ndarray:
+    """Para imágenes oscuras."""
+    return _image_agcwd(img_u8, a=a_val, truncated_cdf=True)
+
+
+def _compress_highlights(v_channel: np.ndarray, sat_mask: np.ndarray, strength: float = 0.55) -> np.ndarray:
+    """Comprime zonas sobreexpuestas localmente."""
+    v = v_channel.astype(np.float32)
+    out = v.copy()
+    norm = v / 255.0
+    out[sat_mask > 0] = 255.0 * np.power(norm[sat_mask > 0], 1.0 / max(strength, 1e-3))
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _correct_frame(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    Corrección robusta de iluminación:
+    - trabaja sobre luminancia V en HSV
+    - detecta highlights
+    - aplica AGCWD según iluminación global
+    - comprime highlights localmente
+    """
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    mean_v = float(np.mean(v))
+    p95_v = float(np.percentile(v, 95))
+    sat_ratio = float(np.mean(v > 245))
+
+    # Máscara de sobreexposición
+    sat_mask = ((v > 240) & (s < 80)).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    sat_mask = cv2.morphologyEx(sat_mask, cv2.MORPH_CLOSE, kernel)
+    sat_mask = cv2.medianBlur(sat_mask, 5)
+
+    if mean_v < 110:
+        v_corr = _process_dimmed(v, a_val=0.85)
+        s_corr = cv2.convertScaleAbs(s, alpha=1.5, beta=10)
+    elif mean_v > 130 or p95_v > 240 or sat_ratio > 0.02:
+        v_corr = _process_bright(v, a_val=0.70)
+        v_corr = _compress_highlights(v_corr, sat_mask, strength=0.45)
+        s_corr = cv2.convertScaleAbs(s, alpha=2.0, beta=15)
+    else:
+        v_corr = v.copy()
+        s_corr = cv2.convertScaleAbs(s, alpha=1.4, beta=5)
+
+    hsv_corr = cv2.merge([h, s_corr, v_corr])
+    return cv2.cvtColor(hsv_corr, cv2.COLOR_HSV2BGR)
+
+
 class ColorSegmentationNode(Node):
     """
     ROS2 Node for HSV-based color segmentation with GUI calibration.
@@ -73,15 +175,15 @@ class ColorSegmentationNode(Node):
         # =================================================================
         # Parameters IR JUGANDO CON ESTOS VALORES
         # =================================================================
-        self.declare_parameter('roi_height_ratio', 0.4)
+        self.declare_parameter('roi_height_ratio', 0.2) 
         self.declare_parameter('brush_size', 8)  # Radius of paint brush for calibration
         self.declare_parameter('lut_filename', 'color_lut.npy')
         self.declare_parameter('input_image_topic', '/camera/color_image/compressed')
         self.declare_parameter('output_mask_topic', '/segmentation/color_mask/compressed')
         self.declare_parameter('jpeg_quality', 10)  # 1-100, lower = more compression
-        self.declare_parameter('clahe_clip_limit', 1.05)
-        self.declare_parameter('clahe_tile_size', 125)
-        self.declare_parameter('edge_kernel_size', 11)
+        self.declare_parameter('clahe_clip_limit', 1.05) #0.5 1.05
+        self.declare_parameter('clahe_tile_size', 5) #1
+        self.declare_parameter('edge_kernel_size', 9)
         self.declare_parameter('enable_edge_detection', True)
         self.declare_parameter('debug_logging', True)
         self.declare_parameter('smoothing_sigma', 14.0)
@@ -97,7 +199,7 @@ class ColorSegmentationNode(Node):
         # =================================================================
         # NEW: Robot mask (hide robot parts visible in image)
         # =================================================================
-        self.declare_parameter('enable_robot_mask', True)
+        self.declare_parameter('enable_robot_mask', False)
         self.declare_parameter('robot_mask_x1', 400)      # Top-left X
         self.declare_parameter('robot_mask_y1', 430)      # Top-left Y
         self.declare_parameter('robot_mask_x2', 530)      # Bottom-right X
@@ -107,8 +209,13 @@ class ColorSegmentationNode(Node):
         # NEW: Morphological cleanup (Close + Open operations)
         # =================================================================
         self.declare_parameter('enable_morph_cleanup', True)
-        self.declare_parameter('morph_kernel_size', 7)  # Kernel size for morphological ops
+        self.declare_parameter('morph_kernel_size', 55)  #65 Kernel size for morphological ops
         self.declare_parameter('lane_dilate_size', 5)   # Lane dilation kernel size (0=disabled)
+
+        # =================================================================
+        # NEW: Adaptive Gamma Correction (AGCWD) preprocessing
+        # =================================================================
+        self.declare_parameter('enable_adapt_gamma', True)
 
         # Get parameters
         self.roi_height_ratio = float(self.get_parameter('roi_height_ratio').value)
@@ -139,6 +246,9 @@ class ColorSegmentationNode(Node):
         # Morphological cleanup params
         self.enable_morph_cleanup = bool(self.get_parameter('enable_morph_cleanup').value)
         self.morph_kernel_size = _odd_ksize(self.get_parameter('morph_kernel_size').value)
+
+        # Adaptive gamma correction
+        self.enable_adapt_gamma = bool(self.get_parameter('enable_adapt_gamma').value)
         self.lane_dilate_size = _odd_ksize(self.get_parameter('lane_dilate_size').value)
 
         # =================================================================
@@ -227,6 +337,7 @@ class ColorSegmentationNode(Node):
         self.get_logger().info(f"  Pre-blur: {self.enable_pre_blur} (k={self.pre_blur_ksize}, sigma={self.pre_blur_sigma})")
         self.get_logger().info(f"  Robot mask: {self.enable_robot_mask} (rect=[{self.robot_mask_x1},{self.robot_mask_y1}]-[{self.robot_mask_x2},{self.robot_mask_y2}])")
         self.get_logger().info(f"  Morph cleanup: {self.enable_morph_cleanup} (kernel={self.morph_kernel_size})")
+        self.get_logger().info(f"  Adapt gamma: {self.enable_adapt_gamma}")
 
         # =================================================================
         # Dynamic Parameter Reconfiguration
@@ -302,6 +413,10 @@ class ColorSegmentationNode(Node):
                 self.morph_kernel_size = _odd_ksize(value)
             elif name == 'lane_dilate_size':
                 self.lane_dilate_size = _odd_ksize(value)
+
+            # --- Adaptive gamma ---
+            elif name == 'enable_adapt_gamma':
+                self.enable_adapt_gamma = bool(value)
 
             # --- Output compression ---
             elif name == 'jpeg_quality':
@@ -748,6 +863,10 @@ class ColorSegmentationNode(Node):
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is None or frame.size == 0:
                 return
+
+            # 0) Adaptive Gamma Correction — normalize illumination
+            if self.enable_adapt_gamma:
+                frame = _correct_frame(frame)
 
             roi, crop_offset = self._crop_roi(frame)
 
