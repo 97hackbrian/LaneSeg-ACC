@@ -27,6 +27,7 @@ from sensor_msgs.msg import CompressedImage
 import cv2
 import numpy as np
 import os
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from scipy.ndimage import gaussian_filter
 
@@ -175,15 +176,15 @@ class ColorSegmentationNode(Node):
         # =================================================================
         # Parameters IR JUGANDO CON ESTOS VALORES
         # =================================================================
-        self.declare_parameter('roi_height_ratio', 0.2) 
+        self.declare_parameter('roi_height_ratio', 0.1) 
         self.declare_parameter('brush_size', 8)  # Radius of paint brush for calibration
         self.declare_parameter('lut_filename', 'color_lut.npy')
-        self.declare_parameter('input_image_topic', '/camera/color_image/compressed')
+        self.declare_parameter('input_image_topic', '/camera/csi_image_2/compressed')
         self.declare_parameter('output_mask_topic', '/segmentation/color_mask/compressed')
         self.declare_parameter('jpeg_quality', 10)  # 1-100, lower = more compression
-        self.declare_parameter('clahe_clip_limit', 1.05) #0.5 1.05
-        self.declare_parameter('clahe_tile_size', 5) #1
-        self.declare_parameter('edge_kernel_size', 9)
+        self.declare_parameter('clahe_clip_limit', 5.05) #0.5 1.05
+        self.declare_parameter('clahe_tile_size', 10) #1
+        self.declare_parameter('edge_kernel_size', 13)
         self.declare_parameter('enable_edge_detection', True)
         self.declare_parameter('debug_logging', True)
         self.declare_parameter('smoothing_sigma', 14.0)
@@ -210,12 +211,24 @@ class ColorSegmentationNode(Node):
         # =================================================================
         self.declare_parameter('enable_morph_cleanup', True)
         self.declare_parameter('morph_kernel_size', 55)  #65 Kernel size for morphological ops
-        self.declare_parameter('lane_dilate_size', 5)   # Lane dilation kernel size (0=disabled)
+        self.declare_parameter('lane_dilate_size', 20)   # Lane dilation kernel size (0=disabled)
 
         # =================================================================
         # NEW: Adaptive Gamma Correction (AGCWD) preprocessing
         # =================================================================
         self.declare_parameter('enable_adapt_gamma', True)
+
+        # =================================================================
+        # NEW: Fisheye Undistortion
+        # =================================================================
+        self.declare_parameter('enable_fisheye_undistortion', True)
+        self.declare_parameter('fisheye_calibration_file', '')
+        self.declare_parameter('undistort_balance', 0.0)
+        self.declare_parameter('undistort_scale', 1.0)
+        self.declare_parameter('undistorted_compressed_topic',
+                               '/qcar2/csi/undistorted/image/compressed')
+        self.declare_parameter('publish_undistorted', True)
+        self.declare_parameter('undistorted_jpeg_quality', 80)
 
         # Get parameters
         self.roi_height_ratio = float(self.get_parameter('roi_height_ratio').value)
@@ -250,6 +263,26 @@ class ColorSegmentationNode(Node):
         # Adaptive gamma correction
         self.enable_adapt_gamma = bool(self.get_parameter('enable_adapt_gamma').value)
         self.lane_dilate_size = _odd_ksize(self.get_parameter('lane_dilate_size').value)
+
+        # Fisheye undistortion params
+        self._fisheye_enabled = bool(self.get_parameter('enable_fisheye_undistortion').value)
+        self._fisheye_calib_file = str(self.get_parameter('fisheye_calibration_file').value)
+        self._undistort_balance = float(self.get_parameter('undistort_balance').value)
+        self._undistort_scale = float(self.get_parameter('undistort_scale').value)
+        self._publish_undistorted = bool(self.get_parameter('publish_undistorted').value)
+        self._undistorted_jpeg_quality = max(1, min(100, int(
+            self.get_parameter('undistorted_jpeg_quality').value)))
+        undistorted_topic = str(
+            self.get_parameter('undistorted_compressed_topic').value)
+
+        # Fisheye calibration state (populated by _load_fisheye_calibration)
+        self._fisheye_K = None          # 3x3 camera matrix
+        self._fisheye_D = None          # 4x1 distortion coeffs
+        self._fisheye_map1 = None       # remap LUT (precomputed)
+        self._fisheye_map2 = None
+        self._fisheye_map_size = None   # (w, h) for which maps were built
+
+
 
         # =================================================================
         # Initialize components
@@ -298,7 +331,9 @@ class ColorSegmentationNode(Node):
                 )
 
         self.lut_path = os.path.join(self._config_dir, self.lut_filename)
-
+        # Attempt to load calibration if undistortion is requested
+        if self._fisheye_enabled:
+            self._load_fisheye_calibration()
         # Try to load existing LUT
         if self._load_lut():
             self.get_logger().info(f"LUT loaded from: {self.lut_path}")
@@ -328,6 +363,10 @@ class ColorSegmentationNode(Node):
         self.sub = self.create_subscription(CompressedImage, input_topic, self.image_callback, qos_input)
         self.pub = self.create_publisher(CompressedImage, output_topic, qos_output)
 
+        # Undistorted image publisher — compressed
+        self.undistorted_pub = self.create_publisher(
+            CompressedImage, undistorted_topic, qos_output)
+
         self.get_logger().info("Color Segmentation Node started")
         self.get_logger().info(f"  Input: {input_topic}")
         self.get_logger().info(f"  Output: {output_topic}")
@@ -338,6 +377,11 @@ class ColorSegmentationNode(Node):
         self.get_logger().info(f"  Robot mask: {self.enable_robot_mask} (rect=[{self.robot_mask_x1},{self.robot_mask_y1}]-[{self.robot_mask_x2},{self.robot_mask_y2}])")
         self.get_logger().info(f"  Morph cleanup: {self.enable_morph_cleanup} (kernel={self.morph_kernel_size})")
         self.get_logger().info(f"  Adapt gamma: {self.enable_adapt_gamma}")
+        self.get_logger().info(f"  Fisheye undistort: {self._fisheye_enabled} "
+                              f"(balance={self._undistort_balance}, "
+                              f"scale={self._undistort_scale})")
+        self.get_logger().info(f"  Undistorted topic: {undistorted_topic} "
+                              f"(publish={self._publish_undistorted})")
 
         # =================================================================
         # Dynamic Parameter Reconfiguration
@@ -418,6 +462,27 @@ class ColorSegmentationNode(Node):
             elif name == 'enable_adapt_gamma':
                 self.enable_adapt_gamma = bool(value)
 
+            # --- Fisheye undistortion ---
+            elif name == 'enable_fisheye_undistortion':
+                self._fisheye_enabled = bool(value)
+                if self._fisheye_enabled and self._fisheye_K is None:
+                    self._load_fisheye_calibration()
+            elif name == 'undistort_balance':
+                self._undistort_balance = float(value)
+                # Invalidate maps so they are recomputed on next frame
+                self._fisheye_map1 = None
+                self._fisheye_map2 = None
+                self._fisheye_map_size = None
+            elif name == 'undistort_scale':
+                self._undistort_scale = float(value)
+                self._fisheye_map1 = None
+                self._fisheye_map2 = None
+                self._fisheye_map_size = None
+            elif name == 'publish_undistorted':
+                self._publish_undistorted = bool(value)
+            elif name == 'undistorted_jpeg_quality':
+                self._undistorted_jpeg_quality = max(1, min(100, int(value)))
+
             # --- Output compression ---
             elif name == 'jpeg_quality':
                 self.jpeg_quality = max(1, min(100, int(value)))
@@ -472,6 +537,125 @@ class ColorSegmentationNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Source config auto-detection failed: {e}")
         return None
+
+    # =====================================================================
+    # Fisheye Undistortion
+    # =====================================================================
+    def _load_fisheye_calibration(self):
+        """
+        Load fisheye calibration (K, D) from a YAML file.
+        On failure: logs a warning, disables undistortion, node continues.
+        """
+        calib_path = self._fisheye_calib_file
+
+        # Auto-detect path if not explicitly provided
+        if not calib_path:
+            calib_path = os.path.join(self._config_dir, 'fisheye_calibration.yaml')
+            
+        if not os.path.isfile(calib_path):
+            self.get_logger().warn(
+                f"Fisheye calibration file not found: {calib_path} — "
+                f"undistortion disabled. Create the file or set "
+                f"'fisheye_calibration_file' parameter.")
+            self._fisheye_enabled = False
+            return
+
+        try:
+            with open(calib_path, 'r') as f:
+                calib = yaml.safe_load(f)
+
+            # Parse camera matrix K (3x3)
+            km = calib.get('camera_matrix', {})
+            k_data = km.get('data')
+            if k_data is None or len(k_data) != 9:
+                raise ValueError("camera_matrix.data must have 9 elements")
+            self._fisheye_K = np.array(k_data, dtype=np.float64).reshape(3, 3)
+
+            # Parse distortion coefficients D (4x1)
+            dc = calib.get('distortion_coefficients', {})
+            d_data = dc.get('data')
+            if d_data is None or len(d_data) != 4:
+                raise ValueError(
+                    "distortion_coefficients.data must have 4 elements")
+            self._fisheye_D = np.array(d_data, dtype=np.float64).reshape(4, 1)
+
+            self.get_logger().info(
+                f"Fisheye calibration loaded from: {calib_path}")
+            self.get_logger().info(
+                f"  K =\n{self._fisheye_K}")
+            self.get_logger().info(
+                f"  D = {self._fisheye_D.flatten()}")
+
+            # Invalidate cached maps so they are recomputed for next frame
+            self._fisheye_map1 = None
+            self._fisheye_map2 = None
+            self._fisheye_map_size = None
+
+        except Exception as e:
+            self.get_logger().warn(
+                f"Failed to parse fisheye calibration ({calib_path}): {e} — "
+                f"undistortion disabled.")
+            self._fisheye_enabled = False
+            self._fisheye_K = None
+            self._fisheye_D = None
+
+    def _compute_undistort_maps(self, w: int, h: int):
+        """
+        Compute remap lookup tables once for the given resolution.
+        Uses cv2.fisheye.initUndistortRectifyMap with precomputed new_K.
+        """
+        K = self._fisheye_K
+        D = self._fisheye_D
+        R = np.eye(3, dtype=np.float64)
+
+        # Estimate new camera matrix with balance
+        new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D, (w, h), R, balance=self._undistort_balance)
+
+        # Apply optional focal length scale
+        if abs(self._undistort_scale - 1.0) > 1e-6:
+            new_K[0, 0] *= self._undistort_scale
+            new_K[1, 1] *= self._undistort_scale
+
+        self._fisheye_map1, self._fisheye_map2 = \
+            cv2.fisheye.initUndistortRectifyMap(
+                K, D, R, new_K, (w, h), cv2.CV_16SC2)
+        self._fisheye_map_size = (w, h)
+
+        self.get_logger().info(
+            f"Fisheye undistort maps computed for {w}x{h} "
+            f"(balance={self._undistort_balance}, "
+            f"scale={self._undistort_scale})")
+
+    def _undistort_frame(self, frame: np.ndarray) -> np.ndarray:
+        """
+        Apply fisheye undistortion using precomputed remap tables.
+        Recomputes maps if resolution changed.
+        """
+        h, w = frame.shape[:2]
+        if self._fisheye_map1 is None or self._fisheye_map_size != (w, h):
+            self._compute_undistort_maps(w, h)
+        return cv2.remap(
+            frame, self._fisheye_map1, self._fisheye_map2,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT)
+
+    def _publish_undistorted_image(self, frame: np.ndarray, header):
+        """
+        Publish the undistorted frame as a CompressedImage (JPEG).
+        Preserves the original header (timestamp + frame_id).
+        """
+        success, buf = cv2.imencode(
+            '.jpg', frame,
+            [cv2.IMWRITE_JPEG_QUALITY, self._undistorted_jpeg_quality])
+        if success:
+            comp_msg = CompressedImage()
+            comp_msg.header = header
+            comp_msg.format = 'jpeg'
+            comp_msg.data = np.array(buf).tobytes()
+            self.undistorted_pub.publish(comp_msg)
+        else:
+            self.get_logger().warn('Failed to encode undistorted frame', throttle_duration_sec=5.0)
 
     # =====================================================================
     # Debug Functions
@@ -863,6 +1047,15 @@ class ColorSegmentationNode(Node):
             frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             if frame is None or frame.size == 0:
                 return
+
+            # ----- Fisheye Undistortion (before any processing) -----
+            if self._fisheye_enabled and self._fisheye_K is not None:
+                frame = self._undistort_frame(frame)
+
+            # Publish camera frame on undistorted topic
+            # (rectified if undistortion active, raw otherwise)
+            if self._publish_undistorted:
+                self._publish_undistorted_image(frame, msg.header)
 
             # 0) Adaptive Gamma Correction — normalize illumination
             if self.enable_adapt_gamma:

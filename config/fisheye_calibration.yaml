@@ -1,0 +1,16 @@
+distortion_model: fisheye
+
+image_width: 820
+image_height: 616
+
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [320.0, 0.0, 410.0,
+         0.0, 320.0, 308.0,
+         0.0, 0.0, 1.0]
+
+distortion_coefficients:
+  rows: 4
+  cols: 1
+  data: [-0.02, 0.0005, 0.0, 0.0]
