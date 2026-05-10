@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """
-HSV Color Segmentation Node with CuPy GPU Acceleration
+Right-Side Edge Detection Node
 
-Real-time semantic segmentation using histogram-based color classification
-in HSV space. All filter stages are fully parametrized via ROS2 dynamic
-reconfiguration (rqt_reconfigure / ros2 param set).
+Real-time detection of pseudo-straight edges on the right side of the
+image. No prior calibration or .npy LUT is required.  All filter stages
+are fully parametrized via ROS2 dynamic reconfiguration
+(rqt_reconfigure / ros2 param set).
 
 Pipeline:
      1. Fisheye Undistortion      — Correct lens distortion            (optional)
      2. Adaptive Gamma (AGCWD)    — Normalize illumination             (optional, 18 params)
      3. ROI Crop                  — Keep bottom portion of image
-     4. Gaussian Pre-blur         — Reduce noise before HSV            (optional)
-     5. HSV + CLAHE               — Convert to HSV & equalize V channel
-     6. LUT Segmentation          — Lookup table with per-label
-                                    probabilistic confidence filtering  (3 thresholds)
-     7. Morphological Cleanup     — Close + Open to fill holes/noise   (optional)
-     8. Edge Detection            — Sidewalk ↔ Road border             (optional)
-     9. Colorize Mask             — Label → BGR color mapping
+     4. Gaussian Pre-blur         — Reduce noise before edge detect    (optional)
+     5. Grayscale + CLAHE         — Equalize contrast
+     6. Canny Edge Detection      — Extract edges
+     7. Morphological Cleanup     — Close + Open to clean edges        (optional)
+     8. Hough Line Detection      — Find pseudo-straight lines
+     9. Right-Side Filtering      — Keep only lines on right half
     10. Robot Mask                — Zero-fill robot-visible region      (optional)
     11. Publish                   — CompressedImage (JPEG)
 
-Output Labels:
-    0 - Sidewalk  (Black)
-    1 - Road      (Blue)
-    2 - Lane      (Yellow)
-    3 - Road Edge (Red)
+Output: Binary mask with detected right-side edges drawn in Red.
 
 Author: hackbrian (+ improvements Eduardex)
 """
@@ -39,8 +35,8 @@ from ament_index_python.packages import get_package_share_directory
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from scipy.ndimage import gaussian_filter
 from sensor_msgs.msg import CompressedImage
+# scipy.ndimage.gaussian_filter ya no se necesita (era para LUT)
 
 # Try to import CuPy for GPU acceleration
 try:
@@ -61,23 +57,16 @@ def _odd_ksize(k: int) -> int:
 
 class ColorSegmentationNode(Node):
     """
-    ROS2 Node for HSV-based color segmentation with GUI calibration.
+    ROS2 Node — Black/White border edge detection.
 
-    Output Labels:
-        0 - Sidewalk (Black mask)
-        1 - Road (Blue mask)
-        2 - Lane (Yellow mask)
-        3 - Road Edge (Red mask)
+    Detects edges that separate a dark region from a bright region
+    (e.g. black court floor vs white wall) using Canny as candidate
+    generator and per-pixel gradient-direction intensity validation.
+    No prior calibration or .npy file needed.
     """
 
-    MASK_COLORS = {
-        0: (0, 0, 0),       # Sidewalk - Black
-        1: (255, 0, 0),     # Road - Blue
-        2: (0, 255, 255),   # Lane - Yellow
-        3: (0, 0, 255),     # Road Edge - Red
-    }
-
-    CLASS_NAMES = ['sidewalk', 'road', 'lane']
+    # Color for validated edge pixels on the output mask
+    EDGE_COLOR = (0, 0, 255)  # Red in BGR
 
     # =================================================================
     # Initialization
@@ -88,6 +77,7 @@ class ColorSegmentationNode(Node):
         # --- Topics & I/O ---
         self.declare_parameter('input_image_topic', '/camera/color_image/compressed')
         self.declare_parameter('output_mask_topic', '/segmentation/color_mask/compressed')
+        self.declare_parameter('canny_debug_topic', '/segmentation/canny_debug/compressed')
         self.declare_parameter('jpeg_quality', 10)
         self.declare_parameter('debug_logging', True)
 
@@ -103,25 +93,40 @@ class ColorSegmentationNode(Node):
         self.declare_parameter('clahe_clip_limit', 5.05)
         self.declare_parameter('clahe_tile_size', 10)
 
-        # --- LUT ---
-        self.declare_parameter('lut_filename', 'color_lut.npy')
-        self.declare_parameter('lut_dir', '')
-        self.declare_parameter('smoothing_sigma', 14.0)
-        self.declare_parameter('brush_size', 8)
+        # --- Canny Edge Detection ---
+        self.declare_parameter('canny_threshold1', 50)
+        self.declare_parameter('canny_threshold2', 150)
+        self.declare_parameter('canny_aperture', 3)
 
-        # --- LUT Confidence (per-label) ---
-        self.declare_parameter('lut_confidence_sidewalk', 0.0)
-        self.declare_parameter('lut_confidence_road', 0.0)
-        self.declare_parameter('lut_confidence_lane', 0.0)
+        # --- Black/White Edge Validation ---
+        self.declare_parameter('use_black_white_edge_filter', True)
+        self.declare_parameter('dark_thresh', 80)
+        self.declare_parameter('bright_thresh', 160)
+        self.declare_parameter('contrast_thresh', 70)
+        self.declare_parameter('sample_offset_px', 5)
+        self.declare_parameter('min_edge_pixels', 50)
+
+        # --- Orientation Filter (reject vertical lines via gradient angle) ---
+        self.declare_parameter('enable_orientation_filter', True)
+        self.declare_parameter('vertical_reject_deg', 25.0)
+
+        # --- Connected-Component Filter (reject small / vertical blobs) ---
+        self.declare_parameter('enable_component_filter', True)
+        self.declare_parameter('min_component_area', 80)
+        self.declare_parameter('min_component_width', 8)
+        self.declare_parameter('max_vertical_angle_deg', 20.0)
+
+        # --- Post-Validation Morphology (engrosamiento de bordes) ---
+        self.declare_parameter('edge_close_size', 7)
+        self.declare_parameter('edge_close_iter', 2)
+        self.declare_parameter('edge_dilate_size', 5)
+        self.declare_parameter('edge_dilate_iter', 2)
 
         # --- Morphological Cleanup ---
         self.declare_parameter('enable_morph_cleanup', True)
-        self.declare_parameter('morph_kernel_size', 55)
-        self.declare_parameter('lane_dilate_size', 20)
-
-        # --- Edge Detection ---
-        self.declare_parameter('enable_edge_detection', True)
-        self.declare_parameter('edge_kernel_size', 13)
+        self.declare_parameter('morph_kernel_size', 5)
+        self.declare_parameter('morph_close_iter', 2)
+        self.declare_parameter('morph_open_iter', 1)
 
         # --- Robot Mask ---
         self.declare_parameter('enable_robot_mask', False)
@@ -165,18 +170,13 @@ class ColorSegmentationNode(Node):
         # Read parameters
         # =============================================================
         self.roi_height_ratio = float(self.get_parameter('roi_height_ratio').value)
-        self.brush_size = int(self.get_parameter('brush_size').value)
-        self.lut_filename = str(self.get_parameter('lut_filename').value)
         input_topic = str(self.get_parameter('input_image_topic').value)
         output_topic = str(self.get_parameter('output_mask_topic').value)
         self.jpeg_quality = int(self.get_parameter('jpeg_quality').value)
         self.debug_logging = bool(self.get_parameter('debug_logging').value)
-        self.smoothing_sigma = float(self.get_parameter('smoothing_sigma').value)
 
         clip_limit = float(self.get_parameter('clahe_clip_limit').value)
         tile_size = int(self.get_parameter('clahe_tile_size').value)
-        self.edge_kernel_size = int(self.get_parameter('edge_kernel_size').value)
-        self.enable_edge_detection = bool(self.get_parameter('enable_edge_detection').value)
 
         self.enable_pre_blur = bool(self.get_parameter('enable_pre_blur').value)
         self.pre_blur_ksize = _odd_ksize(self.get_parameter('pre_blur_ksize').value)
@@ -190,7 +190,8 @@ class ColorSegmentationNode(Node):
 
         self.enable_morph_cleanup = bool(self.get_parameter('enable_morph_cleanup').value)
         self.morph_kernel_size = _odd_ksize(self.get_parameter('morph_kernel_size').value)
-        self.lane_dilate_size = _odd_ksize(self.get_parameter('lane_dilate_size').value)
+        self.morph_close_iter = int(self.get_parameter('morph_close_iter').value)
+        self.morph_open_iter = int(self.get_parameter('morph_open_iter').value)
 
         self.enable_adapt_gamma = bool(self.get_parameter('enable_adapt_gamma').value)
 
@@ -214,12 +215,40 @@ class ColorSegmentationNode(Node):
         self.agcwd_neutral_sat_alpha = float(self.get_parameter('agcwd_neutral_sat_alpha').value)
         self.agcwd_neutral_sat_beta = float(self.get_parameter('agcwd_neutral_sat_beta').value)
 
-        # LUT confidence
-        self.lut_confidence = [
-            float(self.get_parameter('lut_confidence_sidewalk').value),
-            float(self.get_parameter('lut_confidence_road').value),
-            float(self.get_parameter('lut_confidence_lane').value),
-        ]
+        # Canny params
+        self.canny_threshold1 = int(self.get_parameter('canny_threshold1').value)
+        self.canny_threshold2 = int(self.get_parameter('canny_threshold2').value)
+        self.canny_aperture = _odd_ksize(self.get_parameter('canny_aperture').value)
+
+        # Black/White edge validation params
+        self.use_bw_filter = bool(self.get_parameter('use_black_white_edge_filter').value)
+        self.dark_thresh = int(self.get_parameter('dark_thresh').value)
+        self.bright_thresh = int(self.get_parameter('bright_thresh').value)
+        self.contrast_thresh = int(self.get_parameter('contrast_thresh').value)
+        self.sample_offset_px = int(self.get_parameter('sample_offset_px').value)
+        self.min_edge_pixels = int(self.get_parameter('min_edge_pixels').value)
+
+        # Orientation filter params
+        self.enable_orientation_filter = bool(
+            self.get_parameter('enable_orientation_filter').value)
+        self.vert_reject_deg = float(
+            self.get_parameter('vertical_reject_deg').value)
+
+        # Component filter params
+        self.enable_component_filter = bool(
+            self.get_parameter('enable_component_filter').value)
+        self.min_component_area = int(
+            self.get_parameter('min_component_area').value)
+        self.min_component_width = int(
+            self.get_parameter('min_component_width').value)
+        self.max_vertical_angle_deg = float(
+            self.get_parameter('max_vertical_angle_deg').value)
+
+        # Post-validation morphology params
+        self.edge_close_size = int(self.get_parameter('edge_close_size').value)
+        self.edge_close_iter = int(self.get_parameter('edge_close_iter').value)
+        self.edge_dilate_size = int(self.get_parameter('edge_dilate_size').value)
+        self.edge_dilate_iter = int(self.get_parameter('edge_dilate_iter').value)
 
         # Fisheye params
         self._fisheye_enabled = bool(self.get_parameter('enable_fisheye_undistortion').value)
@@ -244,52 +273,20 @@ class ColorSegmentationNode(Node):
         # =============================================================
         self.clahe = cv2.createCLAHE(clipLimit=clip_limit,
                                      tileGridSize=(tile_size, tile_size))
-        self.lut = None
-        self.lut_gpu = None
-        self.lut_max_prob = None
-        self.lut_max_prob_gpu = None
-
-        # Calibration state
-        self.calibration_mode = False
-        self.calibration_data = {cls: [] for cls in self.CLASS_NAMES}
-        self.current_class_idx = 0
-        self.calibration_frame_hsv = None
-        self.calibration_frame_display = None
-        self.mouse_pos = (0, 0)
-        self._painting = False
-        self._paint_mask = None
-        self._stroke_history = []
         self.frame_count = 0
 
         # =============================================================
-        # Resolve LUT config directory
+        # Resolve config directory (solo para fisheye calibration)
         # =============================================================
-        lut_dir_param = str(self.get_parameter('lut_dir').value)
-        if lut_dir_param:
-            self._config_dir = lut_dir_param
-            self.get_logger().info(f"Using user-provided LUT dir: {self._config_dir}")
+        source_config = self._find_source_config_dir()
+        if source_config:
+            self._config_dir = source_config
         else:
-            source_config = self._find_source_config_dir()
-            if source_config:
-                self._config_dir = source_config
-                self.get_logger().info(f"Auto-detected source config: {self._config_dir}")
-            else:
-                pkg_share = get_package_share_directory('qcar2_laneseg_acc')
-                self._config_dir = os.path.join(pkg_share, 'config')
-                self.get_logger().warn(
-                    f"Could not find source config dir, using share: {self._config_dir}")
-
-        self.lut_path = os.path.join(self._config_dir, self.lut_filename)
+            pkg_share = get_package_share_directory('qcar2_laneseg_acc')
+            self._config_dir = os.path.join(pkg_share, 'config')
 
         if self._fisheye_enabled:
             self._load_fisheye_calibration()
-
-        if self._load_lut():
-            self.get_logger().info(f"LUT loaded from: {self.lut_path}")
-            self._debug_analyze_lut()
-        else:
-            self.get_logger().warn("No LUT found. Calibration mode will start on first image.")
-            self.calibration_mode = True
 
         # =============================================================
         # QoS + Pub/Sub
@@ -299,30 +296,31 @@ class ColorSegmentationNode(Node):
         qos_out = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                              history=HistoryPolicy.KEEP_LAST, depth=1)
 
+        canny_topic = str(self.get_parameter('canny_debug_topic').value)
+
         self.sub = self.create_subscription(
             CompressedImage, input_topic, self.image_callback, qos_in)
         self.pub = self.create_publisher(CompressedImage, output_topic, qos_out)
+        self.canny_pub = self.create_publisher(CompressedImage, canny_topic, qos_out)
         self.undistorted_pub = self.create_publisher(
             CompressedImage, undistorted_topic, qos_out)
 
         # Startup log
-        self.get_logger().info("Color Segmentation Node started")
+        self.get_logger().info("Right-Side Edge Detection Node started")
         self.get_logger().info(f"  Input: {input_topic}")
         self.get_logger().info(f"  Output: {output_topic}")
-        self.get_logger().info(f"  CuPy GPU: {'Enabled' if CUPY_AVAILABLE else 'Disabled'}")
         self.get_logger().info(f"  Pre-blur: {self.enable_pre_blur} (k={self.pre_blur_ksize})")
         self.get_logger().info(f"  Morph cleanup: {self.enable_morph_cleanup} (k={self.morph_kernel_size})")
         self.get_logger().info(f"  Adapt gamma: {self.enable_adapt_gamma}")
         self.get_logger().info(
-            f"  AGCWD: mean_v=[{self.agcwd_mean_v_low},{self.agcwd_mean_v_high}] "
-            f"dim_a={self.agcwd_dimmed_alpha} brt_a={self.agcwd_bright_alpha}")
+            f"  Canny: t1={self.canny_threshold1} t2={self.canny_threshold2}")
         self.get_logger().info(
-            f"  LUT confidence: sw={self.lut_confidence[0]} "
-            f"rd={self.lut_confidence[1]} ln={self.lut_confidence[2]}")
+            f"  BW filter: dark<{self.dark_thresh} bright>{self.bright_thresh} "
+            f"contrast>{self.contrast_thresh} offset={self.sample_offset_px}px")
+        self.get_logger().info(f"  Canny debug: {canny_topic}")
         self.get_logger().info(
             f"  Fisheye: {self._fisheye_enabled} "
             f"(bal={self._undistort_balance}, scl={self._undistort_scale})")
-
         self.add_on_set_parameters_callback(self._parameter_callback)
     # =================================================================
     # Dynamic Parameter Callback
@@ -332,10 +330,8 @@ class ColorSegmentationNode(Node):
             n, v = param.name, param.value
             # ROI / General
             if n == 'roi_height_ratio':       self.roi_height_ratio = float(v)
-            elif n == 'smoothing_sigma':      self.smoothing_sigma = float(v)
             elif n == 'debug_logging':        self.debug_logging = bool(v)
             elif n == 'jpeg_quality':         self.jpeg_quality = max(1, min(100, int(v)))
-            elif n == 'brush_size':           self.brush_size = max(1, int(v))
             # CLAHE
             elif n == 'clahe_clip_limit':
                 self.clahe = cv2.createCLAHE(
@@ -345,9 +341,6 @@ class ColorSegmentationNode(Node):
                 self.clahe = cv2.createCLAHE(
                     clipLimit=float(self.get_parameter('clahe_clip_limit').value),
                     tileGridSize=(int(v), int(v)))
-            # Edge
-            elif n == 'edge_kernel_size':        self.edge_kernel_size = int(v)
-            elif n == 'enable_edge_detection':   self.enable_edge_detection = bool(v)
             # Pre-blur
             elif n == 'enable_pre_blur':   self.enable_pre_blur = bool(v)
             elif n == 'pre_blur_ksize':    self.pre_blur_ksize = _odd_ksize(v)
@@ -361,7 +354,32 @@ class ColorSegmentationNode(Node):
             # Morph
             elif n == 'enable_morph_cleanup': self.enable_morph_cleanup = bool(v)
             elif n == 'morph_kernel_size':    self.morph_kernel_size = _odd_ksize(v)
-            elif n == 'lane_dilate_size':     self.lane_dilate_size = _odd_ksize(v)
+            elif n == 'morph_close_iter':     self.morph_close_iter = int(v)
+            elif n == 'morph_open_iter':      self.morph_open_iter = int(v)
+            # Canny
+            elif n == 'canny_threshold1':     self.canny_threshold1 = int(v)
+            elif n == 'canny_threshold2':     self.canny_threshold2 = int(v)
+            elif n == 'canny_aperture':       self.canny_aperture = _odd_ksize(v)
+            # Black/White edge validation
+            elif n == 'use_black_white_edge_filter': self.use_bw_filter = bool(v)
+            elif n == 'dark_thresh':            self.dark_thresh = int(v)
+            elif n == 'bright_thresh':          self.bright_thresh = int(v)
+            elif n == 'contrast_thresh':        self.contrast_thresh = int(v)
+            elif n == 'sample_offset_px':       self.sample_offset_px = int(v)
+            elif n == 'min_edge_pixels':        self.min_edge_pixels = int(v)
+            # Orientation filter
+            elif n == 'enable_orientation_filter':  self.enable_orientation_filter = bool(v)
+            elif n == 'vertical_reject_deg':        self.vert_reject_deg = float(v)
+            # Component filter
+            elif n == 'enable_component_filter':    self.enable_component_filter = bool(v)
+            elif n == 'min_component_area':         self.min_component_area = int(v)
+            elif n == 'min_component_width':        self.min_component_width = int(v)
+            elif n == 'max_vertical_angle_deg':     self.max_vertical_angle_deg = float(v)
+            # Post-validation morphology
+            elif n == 'edge_close_size':        self.edge_close_size = int(v)
+            elif n == 'edge_close_iter':        self.edge_close_iter = int(v)
+            elif n == 'edge_dilate_size':       self.edge_dilate_size = int(v)
+            elif n == 'edge_dilate_iter':       self.edge_dilate_iter = int(v)
             # AGCWD
             elif n == 'enable_adapt_gamma':       self.enable_adapt_gamma = bool(v)
             elif n == 'agcwd_base_alpha':         self.agcwd_base_alpha = float(v)
@@ -382,10 +400,6 @@ class ColorSegmentationNode(Node):
             elif n == 'agcwd_bright_sat_beta':    self.agcwd_bright_sat_beta = float(v)
             elif n == 'agcwd_neutral_sat_alpha':  self.agcwd_neutral_sat_alpha = float(v)
             elif n == 'agcwd_neutral_sat_beta':   self.agcwd_neutral_sat_beta = float(v)
-            # LUT confidence
-            elif n == 'lut_confidence_sidewalk':  self.lut_confidence[0] = float(v)
-            elif n == 'lut_confidence_road':      self.lut_confidence[1] = float(v)
-            elif n == 'lut_confidence_lane':      self.lut_confidence[2] = float(v)
             # Fisheye
             elif n == 'enable_fisheye_undistortion':
                 self._fisheye_enabled = bool(v)
@@ -604,102 +618,6 @@ class ColorSegmentationNode(Node):
             self.undistorted_pub.publish(comp_msg)
 
     # =================================================================
-    # LUT Management
-    # =================================================================
-    @property
-    def _lut_probs_path(self):
-        """Companion file for per-bin max probability."""
-        base, ext = os.path.splitext(self.lut_path)
-        return base + '_probs' + ext
-
-    def _load_lut(self) -> bool:
-        if os.path.exists(self.lut_path):
-            try:
-                self.lut = np.load(self.lut_path)
-                if CUPY_AVAILABLE:
-                    self.lut_gpu = cp.asarray(self.lut)
-                # Load companion probability volume
-                if os.path.exists(self._lut_probs_path):
-                    self.lut_max_prob = np.load(self._lut_probs_path)
-                    if CUPY_AVAILABLE:
-                        self.lut_max_prob_gpu = cp.asarray(self.lut_max_prob)
-                    self.get_logger().info("LUT probability volume loaded.")
-                else:
-                    self.get_logger().warn("No LUT probs file found — confidence filtering disabled.")
-                    self.lut_max_prob = None
-                    self.lut_max_prob_gpu = None
-                return True
-            except Exception as e:
-                self.get_logger().error(f"Failed to load LUT: {e}")
-        return False
-
-    def _save_lut(self) -> bool:
-        try:
-            config_dir = os.path.dirname(self.lut_path)
-            os.makedirs(config_dir, exist_ok=True)
-            np.save(self.lut_path, self.lut)
-            if self.lut_max_prob is not None:
-                np.save(self._lut_probs_path, self.lut_max_prob)
-            self.get_logger().info(f"LUT saved to: {self.lut_path}")
-            return True
-        except Exception as e:
-            self.get_logger().error(f"Failed to save LUT: {e}")
-            return False
-
-    def _generate_lut(self):
-        self.get_logger().info("Generating LUT from calibration data...")
-        self.get_logger().info(f"  Gaussian sigma={self.smoothing_sigma}")
-
-        lut_shape = (180, 256, 256)
-        histograms = []
-
-        for class_idx, class_name in enumerate(self.CLASS_NAMES):
-            class_hist = np.zeros(lut_shape, dtype=np.float32)
-            total_pixels = 0
-            for sample in self.calibration_data[class_name]:
-                for h, s, v in sample:
-                    class_hist[h, s, v] += 1
-                    total_pixels += 1
-            self.get_logger().info(
-                f"  Class {class_idx} ({class_name}): {total_pixels} px")
-            if total_pixels > 0:
-                all_pixels = np.vstack(self.calibration_data[class_name])
-                h_v, s_v, v_v = all_pixels[:, 0], all_pixels[:, 1], all_pixels[:, 2]
-                self.get_logger().info(
-                    f"    HSV: H=[{h_v.min()}-{h_v.max()}] "
-                    f"S=[{s_v.min()}-{s_v.max()}] V=[{v_v.min()}-{v_v.max()}]")
-            if self.smoothing_sigma > 0 and total_pixels > 0:
-                class_hist = gaussian_filter(class_hist, sigma=self.smoothing_sigma,
-                                             mode='wrap')
-            total = class_hist.sum()
-            if total > 0:
-                class_hist /= total
-            histograms.append(class_hist)
-
-        histograms = np.stack(histograms, axis=-1)  # (180,256,256,3)
-        max_probs = np.max(histograms, axis=-1)      # (180,256,256)
-        self.lut = np.argmax(histograms, axis=-1).astype(np.uint8)
-
-        # Store per-bin max probability for confidence filtering
-        self.lut_max_prob = max_probs.astype(np.float32)
-
-        no_samples_mask = max_probs == 0
-        self.lut[no_samples_mask] = 0
-        self.lut_max_prob[no_samples_mask] = 0.0
-
-        num_covered = (~no_samples_mask).sum()
-        self.get_logger().info(
-            f"  LUT coverage: {num_covered} bins "
-            f"({100.0 * num_covered / self.lut.size:.2f}%)")
-
-        if CUPY_AVAILABLE:
-            self.lut_gpu = cp.asarray(self.lut)
-            self.lut_max_prob_gpu = cp.asarray(self.lut_max_prob)
-
-        self.get_logger().info("LUT generation complete!")
-        self._debug_analyze_lut()
-
-    # =================================================================
     # Image Processing Pipeline
     # =================================================================
     def _crop_roi(self, image):
@@ -707,36 +625,231 @@ class ColorSegmentationNode(Node):
         crop_start = int(h * (1 - self.roi_height_ratio))
         return image[crop_start:, :], crop_start
 
-    def _apply_clahe(self, hsv_image):
-        h, s, v = cv2.split(hsv_image)
-        v_equalized = self.clahe.apply(v)
-        return cv2.merge([h, s, v_equalized])
+    def _apply_clahe_gray(self, gray_image):
+        """Apply CLAHE directly on grayscale image."""
+        return self.clahe.apply(gray_image)
 
-    def _segment_with_lut(self, hsv_image):
-        h, s, v = cv2.split(hsv_image)
+    def _morph_cleanup_edges(self, edge_mask: np.ndarray) -> np.ndarray:
+        """Morphological cleanup on binary edge mask."""
+        ks = _odd_ksize(self.morph_kernel_size)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ks, ks))
+        result = cv2.morphologyEx(edge_mask, cv2.MORPH_CLOSE, kernel,
+                                  iterations=self.morph_close_iter)
+        result = cv2.morphologyEx(result, cv2.MORPH_OPEN, kernel,
+                                  iterations=self.morph_open_iter)
+        return result
 
-        if CUPY_AVAILABLE and self.lut_gpu is not None:
-            h_g, s_g, v_g = cp.asarray(h), cp.asarray(s), cp.asarray(v)
-            mask_gpu = self.lut_gpu[h_g, s_g, v_g]
-            mask = cp.asnumpy(mask_gpu)
+    # -----------------------------------------------------------------
+    # Black/White edge validation using gradient-direction sampling
+    # -----------------------------------------------------------------
+    def _validate_bw_edges(self, gray: np.ndarray,
+                           edges: np.ndarray) -> np.ndarray:
+        """
+        For every Canny edge pixel, compute the Sobel gradient direction
+        (normal to the edge), sample intensity on both sides at
+        `sample_offset_px` distance, and accept the pixel only if one
+        side is dark (< dark_thresh) and the other is bright
+        (> bright_thresh) with |diff| > contrast_thresh.
+
+        Returns a uint8 mask (255 = valid edge, 0 = rejected).
+        """
+        h, w = gray.shape
+        offset = max(1, self.sample_offset_px)
+
+        # Sobel gradients to get edge normal direction
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+        # Coordinates of candidate edge pixels
+        ey, ex = np.nonzero(edges)
+        if ey.size == 0:
+            return np.zeros((h, w), dtype=np.uint8)
+
+        # Gradient at edge pixels → normal direction
+        gx_e = gx[ey, ex]
+        gy_e = gy[ey, ex]
+        mag = np.sqrt(gx_e ** 2 + gy_e ** 2) + 1e-6
+        nx = (gx_e / mag)   # unit normal x
+        ny = (gy_e / mag)   # unit normal y
+
+        # Sample coordinates on side A (+normal) and side B (−normal)
+        ax = np.clip(np.round(ex + nx * offset).astype(int), 0, w - 1)
+        ay = np.clip(np.round(ey + ny * offset).astype(int), 0, h - 1)
+        bx = np.clip(np.round(ex - nx * offset).astype(int), 0, w - 1)
+        by = np.clip(np.round(ey - ny * offset).astype(int), 0, h - 1)
+
+        # Intensities on each side
+        ia = gray[ay, ax].astype(np.int16)
+        ib = gray[by, bx].astype(np.int16)
+
+        # Validation: one side dark AND the other bright AND enough contrast
+        dark_a = ia < self.dark_thresh
+        bright_a = ia > self.bright_thresh
+        dark_b = ib < self.dark_thresh
+        bright_b = ib > self.bright_thresh
+        diff = np.abs(ia - ib)
+
+        valid = ((dark_a & bright_b) | (dark_b & bright_a)) & \
+                (diff > self.contrast_thresh)
+
+        # Build validated mask
+        result = np.zeros((h, w), dtype=np.uint8)
+        result[ey[valid], ex[valid]] = 255
+        return result
+
+    # -----------------------------------------------------------------
+    # Connected-component filter: reject small / vertical edge blobs
+    # -----------------------------------------------------------------
+    def _filter_components(self, mask: np.ndarray) -> np.ndarray:
+        """
+        Separate each edge into individual connected components using
+        findContours.  For each component:
+          - Reject if area < min_component_area
+          - Reject if bounding-box width < min_component_width
+          - Compute principal orientation with cv2.fitLine (PCA-based)
+          - Reject if the fitted line is nearly vertical:
+            |angle_from_horizontal| > (90 - max_vertical_angle_deg)
+            i.e. the line deviates less than max_vertical_angle_deg
+            from the Y axis.
+        Rebuild mask with only accepted components.
+        """
+        h, w = mask.shape
+        output = np.zeros_like(mask)
+
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.min_component_area:
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            if bw < self.min_component_width:
+                continue
+
+            # Fit a line through the contour points (PCA direction)
+            # fitLine returns (vx, vy, x0, y0)
+            if len(cnt) < 5:
+                continue
+            [vx, vy, _, _] = cv2.fitLine(
+                cnt, cv2.DIST_L2, 0, 0.01, 0.01)
+            vx, vy = float(vx), float(vy)
+
+            # Angle of the fitted line w.r.t. horizontal (0°=horiz, 90°=vert)
+            angle_deg = abs(np.degrees(np.arctan2(abs(vy), abs(vx))))
+
+            # Reject if the component line is too vertical
+            if angle_deg > (90.0 - self.max_vertical_angle_deg):
+                continue
+
+            # Component accepted — draw it on the output
+            cv2.drawContours(output, [cnt], -1, 255, thickness=cv2.FILLED)
+
+        return output
+
+    def _detect_bw_edges(self, roi_bgr: np.ndarray,
+                         header) -> np.ndarray:
+        """
+        Full edge-detection pipeline with black/white validation:
+          1. Grayscale + CLAHE
+          2. Canny  (candidate edges)
+          3. Publish raw Canny on debug topic
+          4. Morph cleanup on Canny (optional)
+          5. Per-pixel gradient-direction intensity validation
+          6. Optional dilation for visibility
+          7. Paint validated edges in red on a black BGR mask
+        """
+        h, w = roi_bgr.shape[:2]
+
+        # 1) Grayscale + CLAHE
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        gray_eq = self._apply_clahe_gray(gray)
+
+        # 2) Canny edge detection (candidate generator)
+        aperture = _odd_ksize(self.canny_aperture)
+        if aperture < 3:
+            aperture = 3
+        edges = cv2.Canny(gray_eq, self.canny_threshold1,
+                          self.canny_threshold2, apertureSize=aperture)
+
+        # 3) Publish raw Canny for calibration
+        self._publish_canny_debug(edges, header)
+
+        # 4) Morphological cleanup on Canny edges (optional)
+        if self.enable_morph_cleanup:
+            edges = self._morph_cleanup_edges(edges)
+
+        # 5) Black/White intensity validation
+        #    Uses original gray (NOT equalized) for accurate intensity
+        if self.use_bw_filter:
+            validated = self._validate_bw_edges(gray, edges)
         else:
-            mask = self.lut[h, s, v]
+            validated = edges  # Bypass: keep all Canny edges
 
-        # Per-label confidence filtering
-        any_threshold = any(t > 0.0 for t in self.lut_confidence)
-        if any_threshold and self.lut_max_prob is not None:
-            if CUPY_AVAILABLE and self.lut_max_prob_gpu is not None:
-                prob_gpu = self.lut_max_prob_gpu[h_g, s_g, v_g]
-                prob = cp.asnumpy(prob_gpu)
-            else:
-                prob = self.lut_max_prob[h, s, v]
+        # 5b) Orientation filter — reject vertical LINES
+        #     atan2(gy, gx) gives the GRADIENT direction (0-180°).
+        #     Vertical lines have horizontal gradients: angle near 0° or 180°.
+        #     Reject if angle <= vertical_reject_deg OR angle >= 180 - vertical_reject_deg.
+        if self.enable_orientation_filter and np.count_nonzero(validated) > 0:
+            gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            angle_map = np.degrees(np.arctan2(gy, gx))  # -180..180
+            angle_map = np.mod(angle_map, 180.0)         # 0..180
 
-            for label_idx, threshold in enumerate(self.lut_confidence):
-                if threshold > 0.0:
-                    low_conf = (mask == label_idx) & (prob < threshold)
-                    mask[low_conf] = 0  # Fallback to sidewalk
+            vy, vx = np.nonzero(validated)
+            angles = angle_map[vy, vx]
+            # Horizontal gradient = vertical line → reject
+            is_vertical_line = (angles <= self.vert_reject_deg) | \
+                               (angles >= 180.0 - self.vert_reject_deg)
+            validated[vy[is_vertical_line], vx[is_vertical_line]] = 0
 
-        return mask
+        # 5c) Connected-component filter — reject small or vertical blobs
+        #     Uses findContours + fitLine to compute the principal
+        #     orientation of each edge fragment independently, BEFORE
+        #     dilation/close so distinct edges are not merged.
+        if self.enable_component_filter and np.count_nonzero(validated) > 0:
+            validated = self._filter_components(validated)
+
+        # 5d) Minimum pixel count — discard if too few validated pixels
+        if np.count_nonzero(validated) < self.min_edge_pixels:
+            h, w = roi_bgr.shape[:2]
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
+        # 6) Post-validation morphology: close gaps + dilate to thicken
+        #    CLOSE (dilate→erode) connects nearby fragments into
+        #    continuous lines without adding much thickness.
+        cs = _odd_ksize(self.edge_close_size)
+        if cs >= 3 and self.edge_close_iter > 0:
+            ck = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cs, cs))
+            validated = cv2.morphologyEx(
+                validated, cv2.MORPH_CLOSE, ck,
+                iterations=self.edge_close_iter)
+
+        #    DILATE thickens the surviving edge line for visibility.
+        ds = _odd_ksize(self.edge_dilate_size)
+        if ds >= 3 and self.edge_dilate_iter > 0:
+            dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ds, ds))
+            validated = cv2.dilate(
+                validated, dk, iterations=self.edge_dilate_iter)
+
+        # 7) Paint validated edge pixels in red
+        output = np.zeros((h, w, 3), dtype=np.uint8)
+        output[validated > 0] = self.EDGE_COLOR
+
+        return output
+
+    def _publish_canny_debug(self, edges: np.ndarray, header):
+        """Publish raw Canny edges as a compressed grayscale image."""
+        success, buf = cv2.imencode(
+            '.jpg', edges,
+            [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+        if success:
+            msg = CompressedImage()
+            msg.header = header
+            msg.format = 'jpeg'
+            msg.data = np.array(buf).tobytes()
+            self.canny_pub.publish(msg)
 
     def _apply_robot_mask_output(self, full_mask: np.ndarray) -> np.ndarray:
         h, w = full_mask.shape[:2]
@@ -747,156 +860,6 @@ class ColorSegmentationNode(Node):
         if x2 > x1 and y2 > y1:
             full_mask[y1:y2, x1:x2] = 0
         return full_mask
-
-    def _morph_cleanup(self, mask: np.ndarray) -> np.ndarray:
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (self.morph_kernel_size, self.morph_kernel_size))
-        road = (mask == 1).astype(np.uint8) * 255
-        road = cv2.morphologyEx(road, cv2.MORPH_CLOSE, kernel, iterations=1)
-        road = cv2.morphologyEx(road, cv2.MORPH_OPEN, kernel, iterations=1)
-        road_cleaned = road > 0
-        lane = (mask == 2).astype(np.uint8) * 255
-        if self.lane_dilate_size > 1:
-            lk = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (self.lane_dilate_size, self.lane_dilate_size))
-            lane = cv2.dilate(lane, lk, iterations=1)
-        lane_dilated = lane > 0
-        result = np.zeros_like(mask)
-        result[road_cleaned] = 1
-        result[lane_dilated] = 2
-        return result
-
-    def _detect_road_edge(self, mask):
-        road_mask = (mask == 1).astype(np.uint8) * 255
-        sidewalk_mask = (mask == 0).astype(np.uint8) * 255
-        ks = _odd_ksize(self.edge_kernel_size)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ks, ks))
-        road_dilated = cv2.dilate(road_mask, kernel, iterations=2)
-        road_edge = cv2.bitwise_and(road_dilated, sidewalk_mask)
-        erosion_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        road_edge = cv2.erode(road_edge, erosion_kernel, iterations=1)
-        return road_edge > 0
-
-    def _colorize_mask(self, mask):
-        h, w = mask.shape
-        colored = np.zeros((h, w, 3), dtype=np.uint8)
-        for label, color in self.MASK_COLORS.items():
-            colored[mask == label] = color
-        return colored
-
-    # =================================================================
-    # Calibration GUI (Paint-based)
-    # =================================================================
-    def _collect_painted_pixels(self, x, y):
-        if self.calibration_frame_hsv is None or self._paint_mask is None:
-            return
-        h, w = self.calibration_frame_hsv.shape[:2]
-        stamp = np.zeros((h, w), dtype=np.uint8)
-        cv2.circle(stamp, (x, y), self.brush_size, 255, -1)
-        new_pixels = (stamp > 0) & (self._paint_mask == 0)
-        if not np.any(new_pixels):
-            return
-        hsv_pixels = self.calibration_frame_hsv[new_pixels]
-        current_class = self.CLASS_NAMES[self.current_class_idx]
-        self.calibration_data[current_class].append(hsv_pixels)
-
-    def _mouse_callback(self, event, x, y, flags, param):
-        self.mouse_pos = (x, y)
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self._painting = True
-            if self._paint_mask is not None:
-                self._stroke_history.append(self._paint_mask.copy())
-            self._collect_painted_pixels(x, y)
-            if self._paint_mask is not None:
-                cv2.circle(self._paint_mask, (x, y), self.brush_size, 255, -1)
-        elif event == cv2.EVENT_MOUSEMOVE and self._painting:
-            self._collect_painted_pixels(x, y)
-            if self._paint_mask is not None:
-                cv2.circle(self._paint_mask, (x, y), self.brush_size, 255, -1)
-        elif event == cv2.EVENT_LBUTTONUP:
-            self._painting = False
-
-    def _advance_class(self):
-        current_class = self.CLASS_NAMES[self.current_class_idx]
-        total_px = sum(len(s) for s in self.calibration_data[current_class])
-        if total_px == 0:
-            self.get_logger().warn("No pixels painted — paint a region first.")
-            return
-        self.get_logger().info(f"Class '{current_class}' done: {total_px} px collected.")
-        self.current_class_idx += 1
-        self._paint_mask[:] = 0
-        self._stroke_history.clear()
-        if self.current_class_idx >= len(self.CLASS_NAMES):
-            self._finish_calibration()
-
-    def _finish_calibration(self):
-        self.get_logger().info("Calibration complete! Generating LUT...")
-        cv2.destroyAllWindows()
-        self._generate_lut()
-        self._save_lut()
-        self.calibration_mode = False
-        self._paint_mask = None
-        self._stroke_history.clear()
-        self.get_logger().info("Ready for segmentation!")
-
-    def _run_calibration_gui(self, roi_bgr, hsv_normalized):
-        self.calibration_frame_hsv = hsv_normalized.copy()
-        self.calibration_frame_display = roi_bgr.copy()
-        h, w = roi_bgr.shape[:2]
-        if self._paint_mask is None or self._paint_mask.shape[:2] != (h, w):
-            self._paint_mask = np.zeros((h, w), dtype=np.uint8)
-            self._stroke_history.clear()
-        display = roi_bgr.copy()
-        if self._paint_mask is not None:
-            current_class = self.CLASS_NAMES[self.current_class_idx]
-            overlay_color = self.MASK_COLORS.get(self.current_class_idx, (0, 255, 0))
-            if current_class == 'sidewalk':
-                overlay_color = (180, 180, 180)
-            overlay = display.copy()
-            overlay[self._paint_mask > 0] = overlay_color
-            cv2.addWeighted(overlay, 0.45, display, 0.55, 0, display)
-        x, y = self.mouse_pos
-        cv2.circle(display, (x, y), self.brush_size, (0, 255, 0), 1)
-        current_class = self.CLASS_NAMES[self.current_class_idx]
-        color = self.MASK_COLORS[self.current_class_idx]
-        text_color = (255, 255, 255) if current_class == 'sidewalk' else color
-        num_painted = int((self._paint_mask > 0).sum()) if self._paint_mask is not None else 0
-        cv2.putText(display, f"Paint: {current_class.upper()}  ({num_painted} px)",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
-        cv2.putText(display, "ENTER=confirm | c=clear | u=undo | +/-=brush | q=quit",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
-        cv2.putText(display,
-                    f"Class {self.current_class_idx + 1}/{len(self.CLASS_NAMES)}  "
-                    f"brush={self.brush_size}px",
-                    (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-        cv2.imshow("Calibration", display)
-        cv2.setMouseCallback("Calibration", self._mouse_callback)
-        key = cv2.waitKey(1) & 0xFF
-        if key == 13:
-            self._advance_class()
-        elif key == ord('c'):
-            current_class = self.CLASS_NAMES[self.current_class_idx]
-            total_px = sum(len(s) for s in self.calibration_data[current_class])
-            self._paint_mask[:] = 0
-            self._stroke_history.clear()
-            self.get_logger().info(
-                f"Canvas cleared — {total_px} px saved for '{current_class}'.")
-        elif key == ord('u'):
-            if self._stroke_history:
-                self._paint_mask = self._stroke_history.pop()
-                self.get_logger().info("Undo stroke.")
-            else:
-                self.get_logger().info("Nothing to undo.")
-        elif key == ord('+') or key == ord('='):
-            self.brush_size = min(100, self.brush_size + 2)
-        elif key == ord('-'):
-            self.brush_size = max(1, self.brush_size - 2)
-        elif key == ord('q'):
-            self.get_logger().warn("Calibration cancelled")
-            cv2.destroyAllWindows()
-            rclpy.shutdown()
 
     # =================================================================
     # Main Callback
@@ -930,43 +893,20 @@ class ColorSegmentationNode(Node):
                     roi, (self.pre_blur_ksize, self.pre_blur_ksize),
                     self.pre_blur_sigma)
 
-            # 3) HSV + CLAHE
-            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-            hsv_normalized = self._apply_clahe(hsv)
-
-            if self.calibration_mode:
-                self._run_calibration_gui(roi, hsv_normalized)
-                return
+            # 3) Edge detection con validación negro/blanco
+            colored_mask = self._detect_bw_edges(roi, msg.header)
 
             self.frame_count += 1
-            if self.debug_logging and self.frame_count % 30 == 0:
-                self._debug_log_hsv_stats(hsv_normalized, "Inference")
 
-            # 4) LUT segmentation (with confidence filtering)
-            mask = self._segment_with_lut(hsv_normalized)
-
-            if self.debug_logging and self.frame_count % 30 == 0:
-                self._debug_log_mask_stats(mask)
-
-            # 5) Morphological cleanup
-            if self.enable_morph_cleanup:
-                mask = self._morph_cleanup(mask)
-
-            # 6) Edge detection
-            if self.enable_edge_detection:
-                road_edge = self._detect_road_edge(mask)
-                mask[road_edge] = 3
-
-            # 7) Colorize
-            colored_mask = self._colorize_mask(mask)
+            # 4) Compose full-frame output
             full_mask = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
             full_mask[crop_offset:, :] = colored_mask
 
-            # 8) Robot mask
+            # 5) Robot mask
             if self.enable_robot_mask:
                 full_mask = self._apply_robot_mask_output(full_mask)
 
-            # 9) Publish
+            # 6) Publish
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
             _, compressed_data = cv2.imencode('.jpg', full_mask, encode_params)
             out_msg = CompressedImage()
@@ -978,36 +918,6 @@ class ColorSegmentationNode(Node):
         except Exception as e:
             self.get_logger().error(f"Processing error: {e}")
 
-    # =================================================================
-    # Debug
-    # =================================================================
-    def _debug_analyze_lut(self):
-        if self.lut is None:
-            return
-        self.get_logger().info("=== LUT Analysis ===")
-        self.get_logger().info(f"  Shape: {self.lut.shape}")
-        unique, counts = np.unique(self.lut, return_counts=True)
-        total_bins = self.lut.size
-        for label, count in zip(unique, counts):
-            pct = 100.0 * count / total_bins
-            cn = self.CLASS_NAMES[label] if label < len(self.CLASS_NAMES) else f"unknown_{label}"
-            self.get_logger().info(f"  Class {label} ({cn}): {count} bins ({pct:.2f}%)")
-
-    def _debug_log_hsv_stats(self, hsv_image, context=""):
-        if not self.debug_logging:
-            return
-        h, s, v = cv2.split(hsv_image)
-        self.get_logger().info(
-            f"[{context}] HSV: H=[{h.min()}-{h.max()}] "
-            f"S=[{s.min()}-{s.max()}] V=[{v.min()}-{v.max()}]")
-
-    def _debug_log_mask_stats(self, mask):
-        if not self.debug_logging:
-            return
-        unique, counts = np.unique(mask, return_counts=True)
-        stats = ", ".join([f"{l}:{c}" for l, c in zip(unique, counts)])
-        self.get_logger().info(f"[Mask] Labels: {stats}")
-
 
 def main(args=None):
     rclpy.init(args=args)
@@ -1017,7 +927,6 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
