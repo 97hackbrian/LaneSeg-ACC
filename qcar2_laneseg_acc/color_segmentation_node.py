@@ -75,7 +75,7 @@ class ColorSegmentationNode(Node):
         super().__init__('color_segmentation_node')
 
         # --- Topics & I/O ---
-        self.declare_parameter('input_image_topic', '/camera/color_image/compressed')
+        self.declare_parameter('input_image_topic', '/camera/csi_image_2/compressed')
         self.declare_parameter('output_mask_topic', '/segmentation/color_mask/compressed')
         self.declare_parameter('canny_debug_topic', '/segmentation/canny_debug/compressed')
         self.declare_parameter('jpeg_quality', 10)
@@ -110,11 +110,20 @@ class ColorSegmentationNode(Node):
         self.declare_parameter('enable_orientation_filter', True)
         self.declare_parameter('vertical_reject_deg', 25.0)
 
-        # --- Connected-Component Filter (reject small / vertical blobs) ---
+        # --- Connected-Component Filter (score-based best-edge selection) ---
         self.declare_parameter('enable_component_filter', True)
-        self.declare_parameter('min_component_area', 80)
-        self.declare_parameter('min_component_width', 8)
-        self.declare_parameter('max_vertical_angle_deg', 20.0)
+        self.declare_parameter('edge_min_component_area', 120)
+        self.declare_parameter('edge_min_component_width', 25)
+        self.declare_parameter('edge_min_component_height', 5)
+        self.declare_parameter('edge_max_vertical_ratio', 3.0)
+        self.declare_parameter('edge_max_components_keep', 1)
+
+        # --- Close-Parallel Reject (slot / double-edge detection) ---
+        self.declare_parameter('enable_close_parallel_reject', True)
+        self.declare_parameter('close_edge_dist_px', 18)
+        self.declare_parameter('parallel_angle_tol_deg', 15.0)
+        self.declare_parameter('max_slot_component_area', 500)
+        self.declare_parameter('max_slot_component_width', 80)
 
         # --- Post-Validation Morphology (engrosamiento de bordes) ---
         self.declare_parameter('edge_close_size', 7)
@@ -237,12 +246,28 @@ class ColorSegmentationNode(Node):
         # Component filter params
         self.enable_component_filter = bool(
             self.get_parameter('enable_component_filter').value)
-        self.min_component_area = int(
-            self.get_parameter('min_component_area').value)
-        self.min_component_width = int(
-            self.get_parameter('min_component_width').value)
-        self.max_vertical_angle_deg = float(
-            self.get_parameter('max_vertical_angle_deg').value)
+        self.edge_min_area = int(
+            self.get_parameter('edge_min_component_area').value)
+        self.edge_min_width = int(
+            self.get_parameter('edge_min_component_width').value)
+        self.edge_min_height = int(
+            self.get_parameter('edge_min_component_height').value)
+        self.edge_max_vert_ratio = float(
+            self.get_parameter('edge_max_vertical_ratio').value)
+        self.edge_max_keep = int(
+            self.get_parameter('edge_max_components_keep').value)
+
+        # Close-parallel reject params
+        self.enable_close_parallel_reject = bool(
+            self.get_parameter('enable_close_parallel_reject').value)
+        self.close_edge_dist_px = int(
+            self.get_parameter('close_edge_dist_px').value)
+        self.parallel_angle_tol_deg = float(
+            self.get_parameter('parallel_angle_tol_deg').value)
+        self.max_slot_area = int(
+            self.get_parameter('max_slot_component_area').value)
+        self.max_slot_width = int(
+            self.get_parameter('max_slot_component_width').value)
 
         # Post-validation morphology params
         self.edge_close_size = int(self.get_parameter('edge_close_size').value)
@@ -371,10 +396,18 @@ class ColorSegmentationNode(Node):
             elif n == 'enable_orientation_filter':  self.enable_orientation_filter = bool(v)
             elif n == 'vertical_reject_deg':        self.vert_reject_deg = float(v)
             # Component filter
-            elif n == 'enable_component_filter':    self.enable_component_filter = bool(v)
-            elif n == 'min_component_area':         self.min_component_area = int(v)
-            elif n == 'min_component_width':        self.min_component_width = int(v)
-            elif n == 'max_vertical_angle_deg':     self.max_vertical_angle_deg = float(v)
+            elif n == 'enable_component_filter':      self.enable_component_filter = bool(v)
+            elif n == 'edge_min_component_area':      self.edge_min_area = int(v)
+            elif n == 'edge_min_component_width':     self.edge_min_width = int(v)
+            elif n == 'edge_min_component_height':    self.edge_min_height = int(v)
+            elif n == 'edge_max_vertical_ratio':      self.edge_max_vert_ratio = float(v)
+            elif n == 'edge_max_components_keep':     self.edge_max_keep = int(v)
+            # Close-parallel reject
+            elif n == 'enable_close_parallel_reject':  self.enable_close_parallel_reject = bool(v)
+            elif n == 'close_edge_dist_px':            self.close_edge_dist_px = int(v)
+            elif n == 'parallel_angle_tol_deg':        self.parallel_angle_tol_deg = float(v)
+            elif n == 'max_slot_component_area':       self.max_slot_area = int(v)
+            elif n == 'max_slot_component_width':      self.max_slot_width = int(v)
             # Post-validation morphology
             elif n == 'edge_close_size':        self.edge_close_size = int(v)
             elif n == 'edge_close_iter':        self.edge_close_iter = int(v)
@@ -698,54 +731,160 @@ class ColorSegmentationNode(Node):
         return result
 
     # -----------------------------------------------------------------
-    # Connected-component filter: reject small / vertical edge blobs
+    # Connected-component filter: score-based best-edge selection
     # -----------------------------------------------------------------
     def _filter_components(self, mask: np.ndarray) -> np.ndarray:
         """
-        Separate each edge into individual connected components using
-        findContours.  For each component:
-          - Reject if area < min_component_area
-          - Reject if bounding-box width < min_component_width
-          - Compute principal orientation with cv2.fitLine (PCA-based)
-          - Reject if the fitted line is nearly vertical:
-            |angle_from_horizontal| > (90 - max_vertical_angle_deg)
-            i.e. the line deviates less than max_vertical_angle_deg
-            from the Y axis.
-        Rebuild mask with only accepted components.
+        Separate the validated edge mask into individual connected
+        components using connectedComponentsWithStats (before any
+        dilation/close so distinct edges stay separated).
+
+        For each component compute:
+          - area, bbox width/height, centroid_x, ratio = height/width
+
+        Rejection rules:
+          - area < edge_min_component_area
+          - width < edge_min_component_width
+          - height < edge_min_component_height
+          - ratio > edge_max_vertical_ratio AND width is small
+            (tall-and-narrow = likely a wall opening, not a floor edge)
+
+        Scoring (among survivors):
+          score = area + 2.0 * width + 0.3 * centroid_x
+          Favours large, wide, rightward components.
+
+        Keep only the top edge_max_components_keep components.
         """
         h, w = mask.shape
+        num_labels, labels, stats, centroids = \
+            cv2.connectedComponentsWithStats(mask, connectivity=8)
+
+        # Label 0 is background
+        candidates = []  # (label, score)
+        for i in range(1, num_labels):
+            area   = int(stats[i, cv2.CC_STAT_AREA])
+            bx     = int(stats[i, cv2.CC_STAT_LEFT])
+            by     = int(stats[i, cv2.CC_STAT_TOP])
+            bw     = int(stats[i, cv2.CC_STAT_WIDTH])
+            bh     = int(stats[i, cv2.CC_STAT_HEIGHT])
+            cx     = float(centroids[i][0])
+
+            # --- Rejection rules ---
+            if area < self.edge_min_area:
+                continue
+            if bw < self.edge_min_width:
+                continue
+            if bh < self.edge_min_height:
+                continue
+            # Tall-and-narrow with small width → wall opening
+            ratio = float(bh) / max(float(bw), 1.0)
+            if ratio > self.edge_max_vert_ratio and bw < self.edge_min_width * 2:
+                continue
+
+            # --- Score: favour large, wide, right-side components ---
+            score = float(area) + 2.0 * float(bw) + 0.3 * cx
+            candidates.append((i, score))
+
+        if not candidates:
+            return np.zeros_like(mask)
+
+        # Sort by score descending, keep top N
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        keep = max(1, self.edge_max_keep)
+        chosen = {lbl for lbl, _sc in candidates[:keep]}
+
+        # Rebuild mask with only chosen components
         output = np.zeros_like(mask)
+        for lbl in chosen:
+            output[labels == lbl] = 255
 
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        return output
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.min_component_area:
-                continue
+    # -----------------------------------------------------------------
+    # Close-parallel reject: detect slot / double-edge pairs
+    # -----------------------------------------------------------------
+    def _reject_close_parallel(self, mask: np.ndarray) -> np.ndarray:
+        """
+        After component selection, check if any remaining components
+        form a 'slot' pattern: two nearby, parallel edge fragments
+        (typical of wall openings / doors).
 
-            x, y, bw, bh = cv2.boundingRect(cnt)
-            if bw < self.min_component_width:
-                continue
+        For each pair of components:
+          1. Compute centroid distance
+          2. Compute principal orientation via fitLine
+          3. If distance < close_edge_dist_px AND angle difference
+             < parallel_angle_tol_deg → slot detected
+          4. If BOTH components are small (area < max_slot_component_area
+             AND width < max_slot_component_width), reject both.
+             Otherwise reject only the smaller one.
+             Never reject a large / wide component (the main edge).
+        """
+        h, w = mask.shape
+        num_labels, labels, stats, centroids = \
+            cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-            # Fit a line through the contour points (PCA direction)
-            # fitLine returns (vx, vy, x0, y0)
-            if len(cnt) < 5:
-                continue
-            [vx, vy, _, _] = cv2.fitLine(
-                cnt, cv2.DIST_L2, 0, 0.01, 0.01)
-            vx, vy = float(vx), float(vy)
+        if num_labels <= 2:  # 0=bg + 1 component → nothing to pair
+            return mask
 
-            # Angle of the fitted line w.r.t. horizontal (0°=horiz, 90°=vert)
-            angle_deg = abs(np.degrees(np.arctan2(abs(vy), abs(vx))))
+        # Gather component info: (label, area, width, centroid, angle)
+        comps = []
+        for i in range(1, num_labels):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            bw   = int(stats[i, cv2.CC_STAT_WIDTH])
+            cx   = float(centroids[i][0])
+            cy   = float(centroids[i][1])
 
-            # Reject if the component line is too vertical
-            if angle_deg > (90.0 - self.max_vertical_angle_deg):
-                continue
+            # Orientation via fitLine on component pixels
+            pts = np.argwhere(labels == i)  # (row, col)
+            if len(pts) < 5:
+                angle = 0.0
+            else:
+                pts_xy = pts[:, ::-1].astype(np.float32)  # (col, row)
+                [vx, vy, _, _] = cv2.fitLine(
+                    pts_xy, cv2.DIST_L2, 0, 0.01, 0.01)
+                angle = float(np.degrees(np.arctan2(abs(float(vy)),
+                                                     abs(float(vx)))))
+            comps.append((i, area, bw, cx, cy, angle))
 
-            # Component accepted — draw it on the output
-            cv2.drawContours(output, [cnt], -1, 255, thickness=cv2.FILLED)
+        # Check all pairs
+        reject_labels = set()
+        for a_idx in range(len(comps)):
+            for b_idx in range(a_idx + 1, len(comps)):
+                la, area_a, bw_a, cx_a, cy_a, ang_a = comps[a_idx]
+                lb, area_b, bw_b, cx_b, cy_b, ang_b = comps[b_idx]
 
+                # Distance between centroids
+                dist = np.sqrt((cx_a - cx_b)**2 + (cy_a - cy_b)**2)
+                if dist > self.close_edge_dist_px:
+                    continue
+
+                # Angle difference
+                angle_diff = abs(ang_a - ang_b)
+                if angle_diff > self.parallel_angle_tol_deg:
+                    continue
+
+                # Slot detected — decide what to reject
+                a_is_slot = (area_a < self.max_slot_area and
+                             bw_a < self.max_slot_width)
+                b_is_slot = (area_b < self.max_slot_area and
+                             bw_b < self.max_slot_width)
+
+                if a_is_slot and b_is_slot:
+                    # Both small → reject both
+                    reject_labels.add(la)
+                    reject_labels.add(lb)
+                elif a_is_slot:
+                    reject_labels.add(la)
+                elif b_is_slot:
+                    reject_labels.add(lb)
+                # else: both large → keep both
+
+        if not reject_labels:
+            return mask
+
+        output = mask.copy()
+        for lbl in reject_labels:
+            output[labels == lbl] = 0
         return output
 
     def _detect_bw_edges(self, roi_bgr: np.ndarray,
@@ -811,7 +950,11 @@ class ColorSegmentationNode(Node):
         if self.enable_component_filter and np.count_nonzero(validated) > 0:
             validated = self._filter_components(validated)
 
-        # 5d) Minimum pixel count — discard if too few validated pixels
+        # 5d) Close-parallel reject — remove slot / double-edge pairs
+        if self.enable_close_parallel_reject and np.count_nonzero(validated) > 0:
+            validated = self._reject_close_parallel(validated)
+
+        # 5e) Minimum pixel count — discard if too few validated pixels
         if np.count_nonzero(validated) < self.min_edge_pixels:
             h, w = roi_bgr.shape[:2]
             return np.zeros((h, w, 3), dtype=np.uint8)
